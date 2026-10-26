@@ -106,6 +106,14 @@ describe('plainReleaseNotes', () => {
   it('去掉 markdown 装饰，保留行结构', async () => {
     const { plainReleaseNotes } = await import('../release-notes')
     expect(plainReleaseNotes('### 新增\n- **A** 功能，见 [主页](https://example.com)\n`x` 修复'))
-      .toBe('新增\n· A 功能，见 主页\n· x 修复')
+      .toBe('新增\n· A 功能，见 主页\nx 修复')
+  })
+
+  it('GitHub Atom 返回的 HTML 说明转成可读纯文本', async () => {
+    const { plainReleaseNotes } = await import('../release-notes')
+    const html = '<h1>1.6.0</h1>\n<h2>中文</h2>\n<p>1.6.0 是一次产品级升级。</p>\n<ul>\n<li>全局导航重构</li>\n<li>油画风主题 &amp; 启动动画</li>\n</ul>'
+    expect(plainReleaseNotes(html)).toBe(
+      '1.6.0\n中文\n1.6.0 是一次产品级升级。\n· 全局导航重构\n· 油画风主题 & 启动动画',
+    )
   })
 })
