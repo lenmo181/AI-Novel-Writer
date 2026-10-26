@@ -26,7 +26,7 @@
 
 <p align="center">
   <a href="https://github.com/lenmo181/AI-Novel-Writer/releases"><img src="https://badgen.net/github/tag/lenmo181/AI-Novel-Writer?label=release" alt="Release" /></a>
-  <a href="https://github.com/lenmo181/AI-Novel-Writer/blob/master/LICENSE"><img src="https://badgen.net/badge/license/GPL-3.0/blue" alt="GPL-3.0 License" /></a>
+  <a href="https://github.com/lenmo181/AI-Novel-Writer/blob/main/LICENSE"><img src="https://badgen.net/badge/license/GPL-3.0/blue" alt="GPL-3.0 License" /></a>
   <a href="https://github.com/lenmo181/AI-Novel-Writer/stargazers"><img src="https://badgen.net/github/stars/lenmo181/AI-Novel-Writer" alt="GitHub stars" /></a>
 </p>
 
