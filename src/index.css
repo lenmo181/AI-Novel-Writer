@@ -1,0 +1,385 @@
+/* =====================================================================
+ * 全局样式：Tailwind 入口、旧颜色变量、全局基础样式、滚动条与 CodeMirror 搜索面板。
+ *
+ * 纸墨令牌、原语与外壳的样式在 src/styles/paper-ink 与 src/components/stage。
+ * 这里的 --color-* 是沿用旧组件（提示词模板、写作 Skills、模型表单、架构文档页、导入导出对话框、
+ * 助手面板等）读的颜色：纸墨作用域里由 stage-legacy-bridge.css 换成纸墨令牌，作用域之外（启动页）用这里的值。
+ *
+ * 自定义样式都放进 @layer，否则无层样式会盖过 Tailwind 工具类；只有 CodeMirror 搜索面板故意不进层。
+ * ===================================================================== */
+
+/* Tailwind 只扫 src 里的源码：测试与组件故事里的类名不进产物。 */
+@import "tailwindcss" source(none);
+@source "./";
+@source not "./**/__tests__";
+@source not "./stories";
+@plugin "tailwindcss-animate";
+
+/* dark 变体：根元素带 .dark（深色主题）时生效 */
+@custom-variant dark (&:is(.dark *));
+
+@theme {
+  /* 字体栈：界面默认思源黑体（theme-store 的 applyUiFont 会内联覆盖 --font-sans，此处为兜底） */
+  --font-sans: 'Noto Sans SC', system-ui, -apple-system, sans-serif;
+  --font-mono: 'Fira Code', Consolas, ui-monospace, monospace;
+  --font-writing: 'Noto Serif SC', 'Source Han Serif SC', Georgia, serif;
+}
+
+@layer base {
+  /* 浅色：宣纸底、墨色字、朱砂印 */
+  :root {
+    /* 浅色主题 — 书卷墨韵（宣纸底、墨色字、朱砂印） */
+
+    /* 背景层次（宣纸 → 绢面 → 沉绢） */
+    --color-bg: #F7F3E8;
+    --color-sidebar: #F0EADA;
+    --color-panel: #F0EADA;
+    --color-hover: #EAE3D2;
+    --color-active: #E3DCC9;
+
+    /* 文字层次（浓墨 → 淡墨 → 灰墨） */
+    --color-text: #2B2A26;
+    --color-text-secondary: #6E6A5F;
+    --color-text-muted: #655F55;
+
+    /* 边框（纸边） */
+    --color-border: #E3DCC9;
+
+    /* 强调色（朱砂） */
+    --color-accent: #B5402C;
+    --color-accent-rgb: 181, 64, 44;
+
+    /* 语义色（松烟 / 藤黄 / 朱砂 / 黛青） */
+    --color-success: #527A5B;
+    --color-success-text: #386042;
+    --color-success-foreground: #FFFFFF;
+    --color-warning: #C68A3A;
+    --color-warning-text: #7A5414;
+    --color-error: #B5402C;
+    --color-error-text: #8F3020;
+    --color-info: #54666E;
+
+    /* 编辑器 */
+    --color-editor-bg: #FCFAF3;
+    --color-editor-caret: #7A1F12;
+
+    /* Tooltip */
+    --color-tooltip-bg: #2B2A26;
+    --color-tooltip-text: #FCFAF3;
+    /* Badge */
+    --color-badge-bg: rgba(181, 64, 44, 0.08);
+    --color-badge-text: #B5402C;
+
+    /* ===== 尺寸规范 ===== */
+    --height-panel-header: 36px;
+
+    /* 圆角（纸感收平）：Tailwind 的 rounded-sm 到 rounded-2xl 读这些变量 */
+    --radius-sm: 4px;
+    --radius-md: 4px;
+    --radius-lg: 6px;
+    --radius-xl: 8px;
+    --radius-2xl: 12px;
+
+    /* 阴影（墨色低弥散） */
+    --shadow-popover: 0 16px 40px -8px rgba(43, 42, 38, 0.14), 0 4px 16px -4px rgba(43, 42, 38, 0.07);
+
+    /* 过渡（加入顺滑阻尼） */
+    --transition-fast: 0.12s cubic-bezier(0.16, 1, 0.3, 1);
+
+    /* 字体 */
+    --font-sans: 'Noto Sans SC', system-ui, -apple-system, sans-serif;
+    --font-mono: 'Fira Code', Consolas, ui-monospace, monospace;
+    --font-writing: 'LXGW WenKai', 'Noto Serif SC', serif;
+
+    /* 角色身份色：关系图按角色定位取色，两套主题相同 */
+    --color-role-protagonist: #B5402C;
+    --color-role-antagonist: #54666E;
+    --color-role-supporting: #527A5B;
+    --color-role-minor: #A39D8D;
+  }
+
+  /* 深色 */
+  .dark {
+    --color-bg: #1E1E1E;
+    --color-sidebar: #252526;
+    --color-panel: #252526;
+    --color-hover: #2A2D2E;
+    --color-active: #37373D;
+
+    --color-text: #D4D4D4;
+    --color-text-secondary: #A0A0A0;
+    --color-text-muted: #888888;
+
+    --color-border: #3C3C3C;
+
+    --color-accent: #0E639C;
+    --color-accent-rgb: 14, 99, 156;
+
+    --color-success: #89D185;
+    --color-success-text: #89D185;
+    --color-success-foreground: #181818;
+    --color-warning: #CCA700;
+    --color-warning-text: #CCA700;
+    --color-error: #F14C4C;
+    --color-error-text: #FF8A8A;
+    --color-info: #3794FF;
+
+    --color-editor-bg: #1E1E1E;
+    --color-editor-caret: #FFFFFF;
+
+    --color-tooltip-bg: #252526;
+    --color-tooltip-text: #CCCCCC;
+    --color-badge-bg: #4D4D4D;
+    --color-badge-text: #FFFFFF;
+
+    --shadow-popover: 0 16px 40px -8px rgba(0, 0, 0, 0.7), 0 4px 16px -4px rgba(0, 0, 0, 0.5);
+  }
+
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+
+  html {
+    font-size: 14px;
+    scroll-behavior: smooth;
+  }
+
+  html,
+  body,
+  #root {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    font-family: var(--font-sans);
+    font-size: inherit;
+    line-height: 1.5;
+    color: var(--color-text);
+    background-color: var(--color-bg);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  /* 禁止文本选择 */
+  .no-select {
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  /* 滚动条：细 6px */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: rgba(128, 128, 128, 0.25);
+    border-radius: 3px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(128, 128, 128, 0.45);
+  }
+
+  .dark ::-webkit-scrollbar-thumb {
+    background: rgba(128, 128, 128, 0.20);
+  }
+
+  .dark ::-webkit-scrollbar-thumb:hover {
+    background: rgba(128, 128, 128, 0.40);
+  }
+}
+
+@layer components {
+  /* AI 输出与助手消息的正文 */
+  .assistant-content {
+    line-height: 1.6;
+  }
+
+  .badge-warning {
+    color: var(--color-warning-text);
+  }
+
+  .badge-success {
+    color: var(--color-success-text);
+  }
+
+  .badge-error {
+    color: var(--color-error-text);
+  }
+}
+
+/* 流式输出末尾的光标闪烁 */
+@keyframes agent-cursor-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* =====================================================================
+ * 无层样式 — CodeMirror 搜索面板覆盖（需要最高优先级）
+ * 这些样式故意不放入任何 @layer，使其优先级高于所有层级样式
+ * ===================================================================== */
+
+/* CodeMirror 搜索面板 IDEA 风格 — 扁平化嵌入式设计 */
+/* top: true 时面板在 cm-panels-top，否则在 cm-panels-bottom，统一覆盖 */
+.cm-editor .cm-panels-top:has(.cm-search),
+.cm-editor .cm-panels-bottom:has(.cm-search) {
+  position: static !important;
+  height: auto !important;
+  border: none !important;
+  border-bottom: 1px solid var(--color-border) !important;
+  border-top: none !important;
+  background-color: var(--color-sidebar) !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  order: -1 !important;
+}
+
+/* panels 容器默认有上边框，强制移除 */
+.cm-editor .cm-panels {
+  border-color: var(--color-border) !important;
+}
+
+.cm-panel.cm-search {
+  position: relative !important;
+  display: flex !important;
+  flex-wrap: wrap !important;
+  align-items: center;
+  padding: 6px 12px 2px 12px !important;
+  background-color: var(--color-sidebar) !important;
+  border: none !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  color: var(--color-text);
+  width: 100%;
+  max-width: none !important;
+}
+
+/* br 元素作为 flex 换行符，让查找行和替换行分两行显示 */
+.cm-search br {
+  display: block !important;
+  content: "" !important;
+  width: 0 !important;
+  flex-basis: 100% !important;
+  height: 2px !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  overflow: hidden !important;
+}
+
+.dark .cm-search {
+  background-color: var(--color-sidebar) !important;
+  box-shadow: none !important;
+}
+
+.cm-search input.cm-textfield {
+  background: var(--color-bg) !important;
+  border: 1px solid var(--color-border) !important;
+  color: var(--color-text) !important;
+  border-radius: var(--radius-sm);
+  padding: 2px 6px;
+  font-size: 12px;
+  outline: none;
+  min-width: 130px;
+  max-width: 180px;
+  margin-right: 6px;
+  margin-bottom: 4px;
+  vertical-align: middle;
+  height: 24px;
+}
+
+.cm-search input.cm-textfield:focus {
+  border-color: var(--color-accent) !important;
+}
+
+.cm-search button {
+  background: transparent !important;
+  border: 1px solid transparent !important;
+  color: var(--color-text-secondary) !important;
+  cursor: pointer;
+  padding: 2px 6px !important;
+  border-radius: var(--radius-md);
+  transition: all var(--transition-fast);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-transform: capitalize;
+  margin-right: 6px;
+  margin-bottom: 4px;
+  vertical-align: middle;
+  height: 24px;
+}
+
+.cm-search button:hover {
+  background: var(--color-hover) !important;
+  color: var(--color-text) !important;
+  border-color: var(--color-border) !important;
+}
+
+.cm-search label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  margin-right: 10px;
+  margin-bottom: 4px;
+  cursor: pointer;
+  vertical-align: middle;
+}
+
+.cm-search label:last-of-type {
+  margin-right: 36px !important;
+}
+
+.cm-search input[type="checkbox"] {
+  cursor: pointer;
+  accent-color: var(--color-accent);
+  margin: 0;
+}
+
+.cm-search button[name="close"] {
+  position: absolute !important;
+  top: 6px !important;
+  right: 16px !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  background: transparent !important;
+  border: none !important;
+  border-radius: var(--radius-sm);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  color: var(--color-text-secondary) !important;
+  transition: background-color var(--transition-fast), color var(--transition-fast) !important;
+}
+
+.cm-search button[name="close"]:hover {
+  background: var(--color-hover) !important;
+  color: var(--color-text) !important;
+}
+
+/* 搜索结果高亮 IDEA 风格 */
+.cm-searchMatch {
+  background-color: rgba(var(--color-accent-rgb), 0.3) !important;
+  border-radius: 2px;
+}
+
+.dark .cm-searchMatch {
+  background-color: rgba(var(--color-accent-rgb), 0.4) !important;
+}
+
+.cm-searchMatch-selected {
+  background-color: var(--color-accent) !important;
+  color: white !important;
+}

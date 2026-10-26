@@ -1,0 +1,446 @@
+/**
+ * RevisionRepository — 修稿 (revisions 表 + contents 联动)
+ *
+ * 修稿是基于某一版草稿的探索分支。
+ * 状态流转：pending → merged / discarded
+ */
+import { createHash } from 'node:crypto'
+import { getProjectDb } from '../database'
+import { ContentRepository } from './content-repository'
+import { ReviewCycleRepository } from './review-cycle-repository'
+import type { ExpectedDraftSource } from '../../src/shared/ipc-channels'
+import { assertExpectedDraftSource, SourceDraftChangedError } from './draft-source-guard'
+
+const contentHash = (value: string) => createHash('sha256').update(value).digest('hex')
+const hasReviewCycleSchema = (db: import('better-sqlite3').Database) => Boolean(
+    db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_cycles'").get()
+)
+
+/** 修稿元数据（不含正文） */
+export interface RevisionMeta {
+    id: number
+    baseDraftId: number
+    revisionIndex: number
+    revisionType: string
+    status: string
+    mergedToDraftId: number | null
+    userPrompt: string
+    reviewSourceId: number | null
+    contentId: number
+    wordCount: number
+    createdAt: string
+    updatedAt: string
+}
+
+/** 修稿完整数据（含正文） */
+export interface RevisionFull extends RevisionMeta {
+    content: string
+    sourceDraft: ExpectedDraftSource | null
+}
+
+export interface MergeRevisionRequest {
+    revisionId: number
+    targetDraftId: number
+    expectedDraftContent: string
+    mergedContent: string
+    wordCount: number
+}
+
+export interface MergeRevisionReceipt {
+    revisionId: number
+    targetDraftId: number
+    status: 'revised'
+    wordCount: number
+    idempotent: boolean
+    chapterNumber: number
+    version: number
+    reviewCycle?: {
+        cycleId: string
+        mergedHash: string
+        disposition: 'required' | 'not-required' | 'completed'
+    }
+}
+
+function rowToSourceDraft(row: Record<string, unknown>): ExpectedDraftSource | null {
+    if (
+        typeof row.source_draft_chapter_number !== 'number'
+        || typeof row.source_draft_version !== 'number'
+        || typeof row.source_draft_status !== 'string'
+        || typeof row.source_content !== 'string'
+    ) return null
+    return {
+        id: row.base_draft_id as number,
+        chapterNumber: row.source_draft_chapter_number,
+        version: row.source_draft_version,
+        status: row.source_draft_status as ExpectedDraftSource['status'],
+        content: row.source_content,
+    }
+}
+
+function rowToMeta(row: Record<string, unknown>): RevisionMeta {
+    return {
+        id: row.id as number,
+        baseDraftId: row.base_draft_id as number,
+        revisionIndex: row.revision_index as number,
+        revisionType: row.revision_type as string,
+        status: row.status as string,
+        mergedToDraftId: (row.merged_to_draft_id as number | null) ?? null,
+        userPrompt: (row.user_prompt as string) ?? '',
+        reviewSourceId: (row.review_source_id as number | null) ?? null,
+        contentId: row.content_id as number,
+        wordCount: row.word_count as number,
+        createdAt: row.created_at as string,
+        updatedAt: row.updated_at as string,
+    }
+}
+
+export class RevisionRepository {
+    /**
+     * 创建修稿（事务内原子分配 revision_index，再入内容池 + 元数据）
+     * 不接受调用方传入序号，避免与落库结果不一致。
+     */
+    static create(params: {
+        baseDraftId: number
+        revisionType: 'refine' | 'review-fix'
+        userPrompt?: string
+        reviewSourceId?: number
+        content: string
+        wordCount: number
+        expectedSource?: ExpectedDraftSource
+    }): { id: number; revisionIndex: number } {
+        const db = getProjectDb()
+        if (!db) throw new Error('PROJECT_NOT_OPEN')
+
+        const tx = db.transaction(() => {
+            if (!params.expectedSource) throw new SourceDraftChangedError()
+            assertExpectedDraftSource(db, params.baseDraftId, params.expectedSource)
+            const row = db.prepare(`
+        SELECT MAX(revision_index) as maxIdx FROM revisions WHERE base_draft_id = ?
+      `).get(params.baseDraftId) as { maxIdx: number | null }
+            const revisionIndex = (row.maxIdx ?? 0) + 1
+
+            const contentId = ContentRepository.create(params.content)
+            const result = db.prepare(`
+        INSERT INTO revisions (
+          base_draft_id, revision_index, revision_type,
+          user_prompt, review_source_id,
+          source_draft_chapter_number, source_draft_version, source_draft_status, source_content,
+          content_id, word_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+                params.baseDraftId,
+                revisionIndex,
+                params.revisionType,
+                params.userPrompt ?? '',
+                params.reviewSourceId ?? null,
+                params.expectedSource?.chapterNumber ?? null,
+                params.expectedSource?.version ?? null,
+                params.expectedSource?.status ?? null,
+                params.expectedSource?.content ?? null,
+                contentId,
+                params.wordCount,
+            )
+            return { id: Number(result.lastInsertRowid), revisionIndex }
+        })
+
+        return tx()
+    }
+
+    /**
+     * 原子替换同一草稿的 pending 修稿：新修稿创建失败时，旧 pending
+     * 状态与内容池分配会随整个 SQLite 事务一起回滚。
+     */
+    static replacePending(params: {
+        baseDraftId: number
+        revisionType: 'refine' | 'review-fix'
+        userPrompt?: string
+        reviewSourceId?: number
+        content: string
+        wordCount: number
+        expectedSource?: ExpectedDraftSource
+    }, db = getProjectDb()): { id: number; revisionIndex: number; discardedRevisionIds: number[] } {
+        if (!db) throw new Error('PROJECT_NOT_OPEN')
+
+        return db.transaction(() => {
+            if (!params.expectedSource) throw new SourceDraftChangedError()
+            assertExpectedDraftSource(db, params.baseDraftId, params.expectedSource)
+            const row = db.prepare(`
+        SELECT MAX(revision_index) as maxIdx FROM revisions WHERE base_draft_id = ?
+      `).get(params.baseDraftId) as { maxIdx: number | null }
+            const revisionIndex = (row.maxIdx ?? 0) + 1
+            const contentId = ContentRepository.create(params.content, db)
+            const result = db.prepare(`
+        INSERT INTO revisions (
+          base_draft_id, revision_index, revision_type,
+          user_prompt, review_source_id,
+          source_draft_chapter_number, source_draft_version, source_draft_status, source_content,
+          content_id, word_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+                params.baseDraftId,
+                revisionIndex,
+                params.revisionType,
+                params.userPrompt ?? '',
+                params.reviewSourceId ?? null,
+                params.expectedSource?.chapterNumber ?? null,
+                params.expectedSource?.version ?? null,
+                params.expectedSource?.status ?? null,
+                params.expectedSource?.content ?? null,
+                contentId,
+                params.wordCount,
+            )
+            const id = Number(result.lastInsertRowid)
+            const discardedRevisionIds = (db.prepare(`
+        SELECT id FROM revisions
+        WHERE base_draft_id = ? AND status = 'pending' AND id <> ?
+        ORDER BY id
+      `).all(params.baseDraftId, id) as Array<{ id: number }>).map(row => row.id)
+            db.prepare(`
+        UPDATE revisions SET status = 'discarded', updated_at = datetime('now')
+        WHERE base_draft_id = ? AND status = 'pending' AND id <> ?
+      `).run(params.baseDraftId, id)
+            if (hasReviewCycleSchema(db)) {
+                ReviewCycleRepository.reconcileDiscardedRevisions(discardedRevisionIds, db)
+            }
+            return { id, revisionIndex, discardedRevisionIds }
+        })()
+    }
+
+    /** 列出某草稿的所有修稿 */
+    static listByDraft(baseDraftId: number): RevisionMeta[] {
+        const db = getProjectDb()
+        if (!db) return []
+
+        const rows = db.prepare(`
+      SELECT * FROM revisions
+      WHERE base_draft_id = ?
+      ORDER BY revision_index ASC
+    `).all(baseDraftId) as Record<string, unknown>[]
+
+        return rows.map(rowToMeta)
+    }
+
+    /** 获取某草稿的所有 pending 修稿 */
+    static getPending(baseDraftId: number): RevisionMeta[] {
+        const db = getProjectDb()
+        if (!db) return []
+
+        const rows = db.prepare(`
+      SELECT * FROM revisions
+      WHERE base_draft_id = ? AND status = 'pending'
+      ORDER BY revision_index ASC
+    `).all(baseDraftId) as Record<string, unknown>[]
+
+        return rows.map(rowToMeta)
+    }
+
+    /** 获取修稿完整数据 */
+    static getFull(id: number, db = getProjectDb()): RevisionFull | null {
+        if (!db) return null
+
+        const row = db.prepare(
+            'SELECT * FROM revisions WHERE id = ?'
+        ).get(id) as Record<string, unknown> | undefined
+
+        if (!row) return null
+        const meta = rowToMeta(row)
+        const body = ContentRepository.getBody(meta.contentId, db)
+        return { ...meta, content: body ?? '', sourceDraft: rowToSourceDraft(row) }
+    }
+
+    /** 获取下一个修稿序号 */
+    static getNextIndex(baseDraftId: number): number {
+        const db = getProjectDb()
+        if (!db) return 1
+
+        const row = db.prepare(`
+      SELECT MAX(revision_index) as maxIdx FROM revisions WHERE base_draft_id = ?
+    `).get(baseDraftId) as { maxIdx: number | null }
+
+        return (row.maxIdx ?? 0) + 1
+    }
+
+    /**
+     * 将人工确认的合并正文、草稿状态和修订关系作为一个 SQLite 提交写入。
+     * revisionId 同时是天然的幂等身份：已完成的同一合并只返回读回结果，
+     * 不会再次覆盖之后产生的正文。
+     */
+    static mergeIntoDraft(request: MergeRevisionRequest, db = getProjectDb()): MergeRevisionReceipt {
+        if (!db) throw new Error('PROJECT_NOT_OPEN')
+
+        return db.transaction((): MergeRevisionReceipt => {
+            const target = db.prepare(`
+              SELECT drafts.chapter_number, drafts.version, drafts.status,
+                     drafts.word_count, drafts.content_id, contents.body
+              FROM drafts
+              JOIN contents ON contents.id = drafts.content_id
+              WHERE drafts.id = ?
+            `).get(request.targetDraftId) as {
+                status: string
+                chapter_number: number
+                version: number
+                word_count: number
+                content_id: number
+                body: string
+            } | undefined
+            if (!target) throw new Error('DRAFT_NOT_FOUND')
+
+            const revision = db.prepare(`
+              SELECT base_draft_id, status, merged_to_draft_id,
+                     source_draft_chapter_number, source_draft_version,
+                     source_draft_status, source_content
+              FROM revisions WHERE id = ?
+            `).get(request.revisionId) as {
+                base_draft_id: number
+                status: string
+                merged_to_draft_id: number | null
+                source_draft_chapter_number: number | null
+                source_draft_version: number | null
+                source_draft_status: string | null
+                source_content: string | null
+            } | undefined
+            if (!revision) throw new Error('REVISION_NOT_FOUND')
+            if (revision.base_draft_id !== request.targetDraftId) {
+                throw new Error('REVISION_TARGET_MISMATCH')
+            }
+
+            if (revision.status === 'merged') {
+                if (
+                    revision.merged_to_draft_id !== request.targetDraftId
+                    || target.body !== request.mergedContent
+                    || target.status !== 'revised'
+                    || target.word_count !== request.wordCount
+                ) {
+                    throw new Error('REVISION_ALREADY_MERGED')
+                }
+                let reviewCycle: MergeRevisionReceipt['reviewCycle']
+                if (hasReviewCycleSchema(db)) {
+                    const committed = ReviewCycleRepository.commitMergedRevision({
+                        revisionId: request.revisionId,
+                        mergedHash: contentHash(request.mergedContent),
+                    }, db)
+                    if (committed.bound && committed.cycleId) {
+                        const plan = ReviewCycleRepository.planRecheck(committed.cycleId, db)
+                        reviewCycle = { cycleId: committed.cycleId, mergedHash: contentHash(request.mergedContent),
+                            disposition: plan.disposition }
+                    }
+                }
+                return {
+                    revisionId: request.revisionId,
+                    targetDraftId: request.targetDraftId,
+                    status: 'revised',
+                    wordCount: request.wordCount,
+                    idempotent: true,
+                    chapterNumber: target.chapter_number,
+                    version: target.version,
+                    ...(reviewCycle ? { reviewCycle } : {}),
+                }
+            }
+            if (revision.status !== 'pending') {
+                throw new Error('REVISION_NOT_PENDING')
+            }
+            if (!['draft', 'revised', 'reviewed'].includes(target.status)) {
+                throw new Error('REVISION_TARGET_NOT_EDITABLE')
+            }
+            if (target.body !== request.expectedDraftContent) {
+                throw new Error('REVISION_TARGET_CHANGED')
+            }
+            if (
+                revision.source_draft_chapter_number === null
+                || revision.source_draft_version === null
+                || revision.source_draft_status === null
+                || revision.source_content === null
+            ) {
+                throw new Error('REVISION_SOURCE_MISSING')
+            }
+            if (
+                target.chapter_number !== revision.source_draft_chapter_number
+                || target.version !== revision.source_draft_version
+                || target.status !== revision.source_draft_status
+                || target.body !== revision.source_content
+            ) {
+                throw new Error('REVISION_SOURCE_MISMATCH')
+            }
+            db.prepare('UPDATE contents SET body = ? WHERE id = ?')
+                .run(request.mergedContent, target.content_id)
+            const draftUpdate = db.prepare(`
+              UPDATE drafts
+              SET status = 'revised', word_count = ?, updated_at = datetime('now')
+              WHERE id = ? AND status IN ('draft', 'revised', 'reviewed')
+            `).run(request.wordCount, request.targetDraftId)
+            if (draftUpdate.changes !== 1) {
+                throw new Error('REVISION_TARGET_CHANGED')
+            }
+            const revisionUpdate = db.prepare(`
+              UPDATE revisions
+              SET status = 'merged', merged_to_draft_id = ?, updated_at = datetime('now')
+              WHERE id = ? AND base_draft_id = ? AND status = 'pending'
+            `).run(request.targetDraftId, request.revisionId, request.targetDraftId)
+            if (revisionUpdate.changes !== 1) {
+                throw new Error('REVISION_NOT_PENDING')
+            }
+            let reviewCycle: MergeRevisionReceipt['reviewCycle']
+            if (hasReviewCycleSchema(db)) {
+                const committed = ReviewCycleRepository.commitMergedRevision({
+                    revisionId: request.revisionId,
+                    mergedHash: contentHash(request.mergedContent),
+                }, db)
+                if (committed.bound && committed.cycleId) {
+                    const plan = ReviewCycleRepository.planRecheck(committed.cycleId, db)
+                    reviewCycle = { cycleId: committed.cycleId, mergedHash: contentHash(request.mergedContent),
+                        disposition: plan.disposition }
+                }
+            }
+
+            return {
+                revisionId: request.revisionId,
+                targetDraftId: request.targetDraftId,
+                status: 'revised',
+                wordCount: request.wordCount,
+                idempotent: false,
+                chapterNumber: target.chapter_number,
+                version: target.version,
+                ...(reviewCycle ? { reviewCycle } : {}),
+            }
+        })()
+    }
+
+    /** 标记为已合并（仅 pending → merged） */
+    static markMerged(id: number, mergedToDraftId: number, db = getProjectDb()): void {
+        if (!db) throw new Error('PROJECT_NOT_OPEN')
+
+        db.transaction(() => {
+            if (hasReviewCycleSchema(db) && db.prepare('SELECT 1 FROM review_cycles WHERE revision_id=?').get(id)) {
+                throw new Error('REVISION_MERGE_REQUIRED')
+            }
+            const result = db.prepare(`
+      UPDATE revisions
+      SET status = 'merged', merged_to_draft_id = ?, updated_at = datetime('now')
+      WHERE id = ? AND status = 'pending'
+    `).run(mergedToDraftId, id)
+
+            if (result.changes === 0) {
+                throw new Error('REVISION_NOT_PENDING')
+            }
+        })()
+    }
+
+    /** 标记为已弃用（仅 pending → discarded） */
+    static markDiscarded(id: number, db = getProjectDb()): void {
+        if (!db) throw new Error('PROJECT_NOT_OPEN')
+
+        db.transaction(() => {
+            const result = db.prepare(`
+      UPDATE revisions SET status = 'discarded', updated_at = datetime('now')
+      WHERE id = ? AND status = 'pending'
+    `).run(id)
+
+            if (result.changes === 0) {
+                throw new Error('REVISION_NOT_PENDING')
+            }
+            if (hasReviewCycleSchema(db)) {
+                ReviewCycleRepository.reconcileDiscardedRevisions([id], db)
+            }
+        })()
+    }
+}

@@ -1,0 +1,14 @@
+{
+  "base_url": "https://openapi.yun.139.com/open-ai-space",
+  "personal_saas_base_url": "https://openapi.yun.139.com/open-ai-space",
+  "request": {
+    "commonHeaders": {
+      "version": "2.0.0"
+    }
+  },
+  "debug": {
+    "enabled": false,
+    "quiet": false,
+    "bodies": false
+  }
+}

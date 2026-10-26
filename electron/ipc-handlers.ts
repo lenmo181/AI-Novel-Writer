@@ -1,0 +1,88 @@
+import { ipcMain } from 'electron'
+import { assertGlobalDataReady } from './services/app-data-locator'
+import { getCurrentProjectPath, getProjectDb } from './database'
+
+import { registerConfigController } from './controllers/config-controller'
+import { registerProjectController } from './controllers/project-controller'
+import { registerProjectArchiveController } from './controllers/project-archive-controller'
+import { registerCloudBackupController } from './controllers/cloud-backup-controller'
+import { registerCmCloudController } from './controllers/cm-cloud-controller'
+import { registerFSController } from './controllers/fs-controller'
+import { registerLLMController } from './controllers/llm-controller'
+import { registerGenerationController } from './controllers/generation-controller'
+import { registerDatabaseController } from './controllers/db-controller'
+import { registerKBController } from './controllers/kb-controller'
+import { registerImportController } from './controllers/import-controller'
+import { registerWindowController } from './controllers/window-controller'
+import { registerOfficialHomepageController } from './controllers/official-homepage-controller'
+import { registerModelProviderResourceController } from './controllers/model-provider-resource-controller'
+import { registerFinalizationController } from './controllers/finalization-controller'
+import { registerChapterLifecycleController } from './controllers/chapter-lifecycle-controller'
+import { registerExternalFileGrantController } from './controllers/external-file-grant-controller'
+import { registerAppDataController } from './controllers/app-data-controller'
+import { registerCharacterAvatarController } from './controllers/character-avatar-controller'
+import { CharacterAssetService } from './services/character-asset-service'
+import { projectAccess } from './services/project-access'
+import { getProjectDataRoot } from './services/project-data-locator'
+import { CloudProjectBindingStore } from './services/cloud-project-binding-store'
+import { CmCloudBackupService } from './services/cm-cloud-backup-service'
+
+/**
+ * 注册所有 IPC 通道 — 在主进程启动时调用
+ * (采用多控制器路由模式，解耦各个模块的庞大逻辑)
+ */
+export function registerIPCHandlers() {
+  assertGlobalDataReady()
+
+  // 挂载控制器路由
+  registerWindowController()
+  registerOfficialHomepageController()
+  registerModelProviderResourceController()
+  registerConfigController()
+  registerAppDataController()
+  const cloudProjectBindings = new CloudProjectBindingStore()
+  const cmCloudBackup = new CmCloudBackupService()
+  const notifyProjectSaved = (context: import('../src/shared/ipc-channels').ProjectSessionContext) => {
+    cmCloudBackup.onProjectSaved({
+      projectId: context.projectId,
+      projectPath: context.projectPath,
+      context,
+    })
+  }
+  registerCmCloudController({
+    ipc: { handle: (channel, handler) => {
+      ipcMain.handle(channel, (event, ...args) => handler(event, ...args))
+    } },
+    service: cmCloudBackup,
+  })
+  registerProjectController({
+    removeDeletedProjectBinding: projectId => { cloudProjectBindings.removeDeletedProject(projectId) },
+    onProjectSaved: input => { cmCloudBackup.onProjectSaved(input) },
+  })
+  registerProjectArchiveController()
+  registerCloudBackupController()
+  registerFSController(undefined, { onProjectSaved: notifyProjectSaved })
+  registerExternalFileGrantController()
+  registerGenerationController(registerLLMController())
+  registerDatabaseController({ onProjectSaved: notifyProjectSaved })
+  registerCharacterAvatarController({
+    resolveService(_event, context) {
+      let active
+      try {
+        active = projectAccess.assertCurrentProjectContext(context, getCurrentProjectPath())
+      } catch { return null }
+      const database = getProjectDb()
+      if (!database) return null
+      const service = new CharacterAssetService({ projectId: context.projectId, sessionLease: context.leaseId,
+        storageRoot: getProjectDataRoot(active.rootPath), database })
+      service.recordReclaimableOrphans()
+      return service
+    },
+  })
+  registerFinalizationController()
+  registerChapterLifecycleController()
+  registerKBController()
+  registerImportController()
+
+  console.log('[AI Novel IPC] 所有 Controller 已注册完成')
+}

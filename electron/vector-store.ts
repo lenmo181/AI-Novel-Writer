@@ -1,0 +1,2066 @@
+import { assertKnowledgeSourceIdle, withKnowledgeSourceGate } from './services/knowledge-source-gate'
+/**
+ * AI Novel 向量数据库封装 — 基于 LanceDB
+ *
+ * `chunks` 是始终可用的全文文本事实源。每个嵌入空间都有独立物理表，避免
+ * 不同模型、维度或距离语义的向量混写进同一 Arrow FixedSizeList。
+ */
+import * as lancedb from '@lancedb/lancedb'
+import { Field, FixedSizeList as ArrowFixedSizeList, Float32, Int32, Utf8, Schema as ArrowSchema } from 'apache-arrow'
+import fs from 'node:fs'
+import path from 'node:path'
+import { createHash, randomUUID } from 'node:crypto'
+import { getProjectDataRoot } from './services/project-data-locator'
+import { CANONICAL_PROJECT_DIRECTORY } from '../src/shared/project-format'
+
+// ===== 类型定义 =====
+
+/** 写入 LanceDB 的文本块记录 */
+export interface ChunkRecord {
+  [key: string]: unknown
+  id: string
+  docId: string
+  fileName: string
+  /** 章节号（可选，用于范围检索） */
+  chapterNumber?: number
+  /** 章节标题（可选，用于展示） */
+  chapterTitle?: string
+  text: string
+  vector?: number[]
+  chunkIndex: number
+  totalChunks: number
+  importedAt: string
+  corpusKind: KnowledgeCorpusKind
+}
+
+export type KnowledgeCorpusKind = 'reference' | 'project-knowledge' | 'unknown'
+
+/** 文档元信息（聚合查询结果） */
+export interface DocumentInfo {
+  [key: string]: unknown
+  id: string
+  fileName: string
+  importedAt: string
+  chunkCount: number
+  filePath: string
+  corpusKind: KnowledgeCorpusKind
+}
+
+export interface PortableKnowledgeDocument {
+  docId: string
+  fileName: string
+  corpusKind: KnowledgeCorpusKind
+  chunks: Array<{ chunkIndex: number; text: string }>
+  copy?: KnowledgeCopy
+}
+
+export interface PortableKnowledgeSnapshot {
+  version: 1
+  documents: PortableKnowledgeDocument[]
+}
+
+/** 检索结果 */
+export interface SearchResult {
+  text: string
+  score: number
+  fileName: string
+}
+
+/** 知识库统计 */
+export interface KBStats {
+  documentCount: number
+  totalChunks: number
+  vectorDimension: number
+  hasVectors: boolean
+}
+
+/** 由调用方提供、且不包含密钥的嵌入模型身份。 */
+export interface EmbeddingSpaceIdentity {
+  modelFingerprint?: string
+  distanceMetric?: string
+}
+
+export type EmbeddingSpaceStatus = 'active' | 'building' | 'inactive'
+
+/** 一个可比较的向量集合及其物理表。 */
+export interface EmbeddingSpace {
+  generation: number
+  tableName: string
+  modelFingerprint: string
+  vectorDimension: number
+  distanceMetric: string
+  status: EmbeddingSpaceStatus
+  createdAt: string
+}
+
+export interface EmbeddingSpaceRegistry {
+  version: 1
+  activeGeneration: number | null
+  spaces: EmbeddingSpace[]
+}
+
+/**
+ * A rebuild is deliberately planned only after a real embedding response has
+ * supplied its dimension.  `rebuild` always receives every canonical chunk
+ * and writes an isolated generation; it never appends to the current active
+ * table.
+ */
+export type EmbeddingRebuildMode = 'up-to-date' | 'activate' | 'rebuild'
+
+export interface EmbeddingRebuildPlan {
+  mode: EmbeddingRebuildMode
+  identity: Required<EmbeddingSpaceIdentity>
+  vectorDimension: number
+  chunks: Array<{ id: string; text: string }>
+}
+
+export type EmbeddingRebuildPlanResult =
+  | { success: true; plan: EmbeddingRebuildPlan }
+  | { success: false; error: string }
+
+// ===== 常量 =====
+
+const TABLE_NAME = 'chunks'
+const DOCS_TABLE_NAME = 'documents'
+const EMBEDDING_TABLE_PREFIX = 'chunks__space_'
+const EMBEDDING_REGISTRY_FILE = 'embedding-spaces.json'
+const LEGACY_MODEL_FINGERPRINT = 'legacy:unknown'
+const LEGACY_COMPAT_MODEL_PREFIX = 'legacy:dimension:'
+const DEFAULT_DISTANCE_METRIC = 'l2'
+export const KNOWLEDGE_COPY_MARKER = 'knowledge-copy:'
+
+interface KnowledgeCopy { content: string; indexedHash: string; edited: boolean; indexDirty: boolean }
+const contentHash = (content: string) => createHash('sha256').update(content, 'utf8').digest('hex')
+
+function knowledgeCopyPath(projectStorageRoot: string, docId: string): string {
+  const directory = path.join(projectStorageRoot, 'knowledge-copies')
+  if (fs.existsSync(directory)) {
+    const stat = fs.lstatSync(directory)
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('KNOWLEDGE_COPY_UNSAFE_PATH')
+  }
+  return path.join(directory, `${contentHash(docId)}.json`)
+}
+
+export function readKnowledgeCopy(projectStorageRoot: string, docId: string): KnowledgeCopy | null {
+  const file = knowledgeCopyPath(projectStorageRoot, docId)
+  if (!fs.existsSync(file)) return null
+  const stat = fs.lstatSync(file)
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new Error('KNOWLEDGE_COPY_UNSAFE_PATH')
+  const value = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<KnowledgeCopy>
+  if (typeof value.content !== 'string' || typeof value.indexedHash !== 'string' || typeof value.edited !== 'boolean' || typeof value.indexDirty !== 'boolean') {
+    throw new Error('KNOWLEDGE_COPY_INVALID')
+  }
+  return value as KnowledgeCopy
+}
+
+export function writeKnowledgeCopy(projectStorageRoot: string, docId: string, copy: KnowledgeCopy): void {
+  const file = knowledgeCopyPath(projectStorageRoot, docId)
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  const temporary = `${file}.${randomUUID()}.tmp`
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(copy), { encoding: 'utf8', flag: 'wx' })
+    fs.renameSync(temporary, file)
+  } finally {
+    if (fs.existsSync(temporary)) fs.rmSync(temporary)
+  }
+}
+
+export function isDocumentCopyIndexCurrent(projectStorageRoot: string, docId: string, filePath: unknown): boolean {
+  if (typeof filePath !== 'string' || !filePath.startsWith(KNOWLEDGE_COPY_MARKER)) return true
+  try {
+    const copy = readKnowledgeCopy(projectStorageRoot, docId)
+    return !!copy && !copy.indexDirty && contentHash(copy.content) === copy.indexedHash
+  } catch { return false }
+}
+
+// ===== 连接池（按项目路径缓存） =====
+
+const connectionPool = new Map<string, lancedb.Connection>()
+// Exposing a Connection also permits independently owned Tables. Closing the pool
+// cannot prove those handles were released; migration requires a fresh process.
+const connectionExposure = new Set<string>()
+const migrationFences = new Set<string>()
+function migrationProjectKey(projectPath: string): string {
+  const resolved = path.resolve(projectPath)
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved
+}
+
+export function closeVectorStoreForMigration(projectPath: string): { closed: true; release: () => void } {
+  assertKnowledgeSourceIdle(path.join(path.resolve(projectPath), CANONICAL_PROJECT_DIRECTORY))
+  const key = migrationProjectKey(projectPath)
+  if (connectionExposure.has(key) || migrationFences.has(key)) throw new Error('VECTOR_MIGRATION_BUSY_OR_HANDLES_UNPROVEN')
+  migrationFences.add(key)
+  let released = false
+  return { closed: true, release: () => { if (!released) { released = true; migrationFences.delete(key) } } }
+}
+const embeddingTableCreationOwners = new Set<string>()
+
+function databasePath(projectPath: string): string {
+  return path.join(getProjectDataRoot(projectPath), 'lancedb')
+}
+
+function registryPath(projectPath: string): string {
+  return path.join(getProjectDataRoot(projectPath), EMBEDDING_REGISTRY_FILE)
+}
+
+/** 获取 LanceDB 连接（惰性创建） */
+export async function getConnection(projectPath: string): Promise<lancedb.Connection> {
+  if (migrationFences.has(migrationProjectKey(projectPath))) throw new Error('VECTOR_MIGRATION_FENCED')
+  return withKnowledgeSourceGate(getProjectDataRoot(projectPath), () => getConnectionInternal(projectPath))
+}
+
+async function getConnectionInternal(projectPath: string): Promise<lancedb.Connection> {
+  if (migrationFences.has(migrationProjectKey(projectPath))) throw new Error('VECTOR_MIGRATION_FENCED')
+  const dbPath = databasePath(projectPath)
+  connectionExposure.add(migrationProjectKey(projectPath))
+  const cached = connectionPool.get(dbPath)
+  if (cached) return cached
+
+  fs.mkdirSync(dbPath, { recursive: true })
+  const db = await lancedb.connect(dbPath)
+  connectionPool.set(dbPath, db)
+  return db
+}
+
+/** 关闭指定项目的连接 */
+export function closeConnection(projectPath: string): void {
+  assertKnowledgeSourceIdle(path.join(path.resolve(projectPath), CANONICAL_PROJECT_DIRECTORY))
+  // Closing a cached handle must still work after its DB session was revoked.
+  const dbPath = path.join(path.resolve(projectPath), CANONICAL_PROJECT_DIRECTORY, 'lancedb')
+  const connection = connectionPool.get(dbPath)
+  connectionPool.delete(dbPath)
+  connection?.close()
+}
+
+function canonicalChunkSchema(): ArrowSchema {
+  return new ArrowSchema([
+    new Field('id', new Utf8()),
+    new Field('docId', new Utf8()),
+    new Field('fileName', new Utf8()),
+    new Field('chapterNumber', new Int32(), true),
+    new Field('chapterTitle', new Utf8(), true),
+    new Field('text', new Utf8()),
+    new Field('chunkIndex', new Int32()),
+    new Field('totalChunks', new Int32()),
+    new Field('importedAt', new Utf8()),
+    new Field('corpusKind', new Utf8()),
+  ])
+}
+
+function embeddingChunkSchema(dimension: number): ArrowSchema {
+  return new ArrowSchema([
+    new Field('id', new Utf8()),
+    new Field('docId', new Utf8()),
+    new Field('fileName', new Utf8()),
+    new Field('chapterNumber', new Int32(), true),
+    new Field('chapterTitle', new Utf8(), true),
+    new Field('text', new Utf8()),
+    new Field('vector', new ArrowFixedSizeList(dimension, new Field('item', new Float32())), false),
+    new Field('chunkIndex', new Int32()),
+    new Field('totalChunks', new Int32()),
+    new Field('importedAt', new Utf8()),
+    new Field('corpusKind', new Utf8()),
+  ])
+}
+
+function normalizedIdentity(identity?: EmbeddingSpaceIdentity, dimension?: number): Required<EmbeddingSpaceIdentity> {
+  return {
+    // 旧的 vector-store 直调没有模型描述符；以维度作为保守兼容身份，避免把
+    // 不同维度误判为同一模型，同时不破坏同维度旧调用的读写行为。
+    modelFingerprint: identity?.modelFingerprint?.trim() || `${LEGACY_COMPAT_MODEL_PREFIX}${dimension ?? 'unknown'}`,
+    distanceMetric: identity?.distanceMetric?.trim().toLowerCase() || DEFAULT_DISTANCE_METRIC,
+  }
+}
+
+function validateVectorsForChunks(chunks: readonly unknown[], vectors?: unknown): { vectors?: number[][]; dimension?: number; error?: string } {
+  if (vectors === undefined) return {}
+  if (!Array.isArray(vectors)) {
+    return { error: 'EMBEDDING_RESPONSE_INVALID' }
+  }
+  if (vectors.length !== chunks.length) {
+    return { error: 'EMBEDDING_RESPONSE_INVALID' }
+  }
+  if (vectors.length === 0) {
+    return { error: 'EMBEDDING_RESPONSE_INVALID' }
+  }
+
+  let dimension: number | undefined
+  const normalized: number[][] = []
+  for (let index = 0; index < vectors.length; index += 1) {
+    const vector = vectors[index]
+    if (!Array.isArray(vector) || vector.length === 0) {
+      return { error: 'EMBEDDING_RESPONSE_INVALID' }
+    }
+    if (dimension === undefined) {
+      dimension = vector.length
+    } else if (vector.length !== dimension) {
+      return { error: 'EMBEDDING_RESPONSE_INVALID' }
+    }
+    const values: number[] = []
+    for (const value of vector) {
+      if (typeof value !== 'number' || !Number.isFinite(value)) {
+        return { error: 'EMBEDDING_RESPONSE_INVALID' }
+      }
+      values.push(value)
+    }
+    normalized.push(values)
+  }
+
+  return { vectors: normalized, dimension }
+}
+
+function validateChunks(chunks: unknown): chunks is string[] {
+  return Array.isArray(chunks) && chunks.length > 0 && chunks.every(chunk => typeof chunk === 'string')
+}
+
+function asNumberArray(value: unknown): number[] | undefined {
+  if (Array.isArray(value)) return value.filter((entry): entry is number => typeof entry === 'number')
+  if (value && typeof value === 'object' && 'toArray' in value && typeof value.toArray === 'function') {
+    return asNumberArray(value.toArray())
+  }
+  if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
+    return Array.from(value as unknown as ArrayLike<number>)
+  }
+  return undefined
+}
+
+function vectorIsUsable(value: unknown, dimension?: number): boolean {
+  const vector = asNumberArray(value)
+  return vector !== undefined
+    && vector.length > 0
+    && (dimension === undefined || vector.length === dimension)
+    && vector.every(Number.isFinite)
+}
+
+function dimensionFromField(field: { type?: unknown } | undefined): number | undefined {
+  if (!field?.type || typeof field.type !== 'object') return undefined
+  const listSize = (field.type as { listSize?: unknown }).listSize
+  return typeof listSize === 'number' && Number.isInteger(listSize) && listSize > 0 ? listSize : undefined
+}
+
+async function vectorDimensionFromTable(table: lancedb.Table): Promise<number | undefined> {
+  const schema = await table.schema()
+  const vectorField = schema.fields.find(field => field.name === 'vector')
+  const fieldDimension = dimensionFromField(vectorField)
+  if (fieldDimension !== undefined) return fieldDimension
+
+  if (!vectorField) return undefined
+  const rows = await table.query().select(['vector']).limit(1).toArray()
+  const vector = rows[0] && asNumberArray((rows[0] as { vector?: unknown }).vector)
+  return vector?.length || undefined
+}
+
+function emptyRegistry(): EmbeddingSpaceRegistry {
+  return { version: 1, activeGeneration: null, spaces: [] }
+}
+
+export function validateRegistry(value: unknown): EmbeddingSpaceRegistry {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('EMBEDDING_SPACE_REGISTRY_INVALID')
+  }
+  const candidate = value as Partial<EmbeddingSpaceRegistry>
+  if (candidate.version !== 1 || !Array.isArray(candidate.spaces)) {
+    throw new Error('EMBEDDING_SPACE_REGISTRY_INVALID')
+  }
+  const spaces = candidate.spaces.map((space) => {
+    if (
+      !space
+      || typeof space.generation !== 'number'
+      || !Number.isInteger(space.generation)
+      || space.generation < 0
+      || typeof space.tableName !== 'string'
+      || !space.tableName
+      || typeof space.modelFingerprint !== 'string'
+      || !space.modelFingerprint
+      || typeof space.vectorDimension !== 'number'
+      || !Number.isInteger(space.vectorDimension)
+      || space.vectorDimension <= 0
+      || typeof space.distanceMetric !== 'string'
+      || !space.distanceMetric
+      || !['active', 'building', 'inactive'].includes(space.status)
+      || typeof space.createdAt !== 'string'
+    ) {
+      throw new Error('EMBEDDING_SPACE_REGISTRY_INVALID')
+    }
+    return { ...space }
+  })
+  const activeGeneration = candidate.activeGeneration ?? null
+  if (activeGeneration !== null && (!Number.isInteger(activeGeneration) || !spaces.some(space => space.generation === activeGeneration))) {
+    throw new Error('EMBEDDING_SPACE_REGISTRY_INVALID')
+  }
+  return { version: 1, activeGeneration, spaces }
+}
+
+function readRegistry(projectPath: string): EmbeddingSpaceRegistry | undefined {
+  const filePath = registryPath(projectPath)
+  if (!fs.existsSync(filePath)) return undefined
+  try {
+    return validateRegistry(JSON.parse(fs.readFileSync(filePath, 'utf8')))
+  } catch (error) {
+    throw new Error('EMBEDDING_SPACE_REGISTRY_INVALID', { cause: error })
+  }
+}
+
+function writeRegistry(projectPath: string, registry: EmbeddingSpaceRegistry): void {
+  const filePath = registryPath(projectPath)
+  fs.mkdirSync(path.dirname(filePath), { recursive: true })
+  const temporaryPath = `${filePath}.${randomUUID()}.tmp`
+  try {
+    fs.writeFileSync(temporaryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8')
+    fs.renameSync(temporaryPath, filePath)
+  } finally {
+    if (fs.existsSync(temporaryPath)) fs.rmSync(temporaryPath, { force: true })
+  }
+}
+
+async function inferLegacyRegistry(
+  db: lancedb.Connection,
+  tableNames: string[],
+): Promise<EmbeddingSpaceRegistry> {
+  const registry = emptyRegistry()
+  if (tableNames.includes(TABLE_NAME)) {
+    const legacyTable = await db.openTable(TABLE_NAME)
+    try {
+    const dimension = await vectorDimensionFromTable(legacyTable)
+    if (dimension !== undefined) {
+      registry.activeGeneration = 0
+      registry.spaces.push({
+        generation: 0,
+        tableName: TABLE_NAME,
+        modelFingerprint: LEGACY_MODEL_FINGERPRINT,
+        vectorDimension: dimension,
+        distanceMetric: DEFAULT_DISTANCE_METRIC,
+        status: 'active',
+        createdAt: new Date().toISOString(),
+      })
+    }
+    } finally { legacyTable.close() }
+  }
+  return registry
+}
+
+async function loadOrRegisterLegacyRegistry(
+  projectPath: string,
+  db: lancedb.Connection,
+  tableNames: string[],
+): Promise<EmbeddingSpaceRegistry> {
+  const stored = readRegistry(projectPath)
+  if (stored) return stored
+
+  const registry = await inferLegacyRegistry(db, tableNames)
+  if (registry.spaces.length > 0) {
+    // 只登记，不转换、更名或删除旧表。
+    writeRegistry(projectPath, registry)
+  }
+  return registry
+}
+
+/** 读取当前元数据；旧 2048 表会在这里安全登记为 legacy 空间。 */
+export async function getEmbeddingSpaces(projectPath: string): Promise<EmbeddingSpaceRegistry> {
+  return withKnowledgeSourceGate(getProjectDataRoot(projectPath), () => getEmbeddingSpacesInternal(projectPath))
+}
+
+async function getEmbeddingSpacesInternal(projectPath: string): Promise<EmbeddingSpaceRegistry> {
+  const db = await getConnection(projectPath)
+  const registry = await loadOrRegisterLegacyRegistry(projectPath, db, await db.tableNames())
+  return {
+    ...registry,
+    spaces: registry.spaces.map(space => ({ ...space })),
+  }
+}
+
+function matchingSpace(
+  registry: EmbeddingSpaceRegistry,
+  identity: Required<EmbeddingSpaceIdentity>,
+  dimension: number,
+): EmbeddingSpace | undefined {
+  return registry.spaces.find(space => (
+    space.modelFingerprint === identity.modelFingerprint
+    && space.distanceMetric === identity.distanceMetric
+    && space.vectorDimension === dimension
+  ))
+}
+
+function nextSpace(registry: EmbeddingSpaceRegistry, identity: Required<EmbeddingSpaceIdentity>, dimension: number): EmbeddingSpace {
+  const generation = Math.max(0, ...registry.spaces.map(space => space.generation)) + 1
+  return {
+    generation,
+    tableName: `${EMBEDDING_TABLE_PREFIX}${generation}`,
+    modelFingerprint: identity.modelFingerprint,
+    distanceMetric: identity.distanceMetric,
+    vectorDimension: dimension,
+    status: 'building',
+    createdAt: new Date().toISOString(),
+  }
+}
+
+function embeddingTableDirectory(projectPath: string, tableName: string): string {
+  return path.join(databasePath(projectPath), `${tableName}.lance`)
+}
+
+function removeEmptyUnregisteredTableDirectory(projectPath: string, tableName: string): void {
+  const tableDirectory = embeddingTableDirectory(projectPath, tableName)
+  if (!fs.existsSync(tableDirectory)) return
+  const stat = fs.statSync(tableDirectory)
+  if (!stat.isDirectory() || fs.readdirSync(tableDirectory).length > 0) {
+    throw new Error('EMBEDDING_SPACE_UNREGISTERED_DATA')
+  }
+  fs.rmdirSync(tableDirectory)
+}
+
+async function cleanupOwnedTableCreation(
+  projectPath: string,
+  db: lancedb.Connection,
+  tableName: string,
+): Promise<void> {
+  const registry = readRegistry(projectPath)
+  if (registry?.spaces.some(space => space.tableName === tableName)) return
+  try {
+    if ((await db.tableNames()).includes(tableName)) {
+      await db.dropTable(tableName)
+    } else {
+      removeEmptyUnregisteredTableDirectory(projectPath, tableName)
+    }
+  } catch (cleanupError) {
+    console.warn(`[AI Novel VectorStore] 清理本次失败的嵌入表 ${tableName} 失败:`, cleanupError)
+  }
+}
+
+async function createOwnedEmbeddingTable(
+  projectPath: string,
+  db: lancedb.Connection,
+  space: EmbeddingSpace,
+  records: ReadonlyArray<Record<string, unknown>>,
+  schema: ArrowSchema,
+): Promise<void> {
+  const ownershipKey = `${databasePath(projectPath)}\0${space.tableName}`
+  if (embeddingTableCreationOwners.has(ownershipKey)) {
+    throw new Error('EMBEDDING_SPACE_BUSY')
+  }
+
+  embeddingTableCreationOwners.add(ownershipKey)
+  try {
+    // A native createTable failure can leave an empty unregistered directory.
+    // Removing only an empty exact candidate is safe and lets the same
+    // generation be retried without deleting any table that contains data.
+    removeEmptyUnregisteredTableDirectory(projectPath, space.tableName)
+    try {
+      await db.createTable(space.tableName, recordsForSchema(records, schema), { schema })
+    } catch (error) {
+      await cleanupOwnedTableCreation(projectPath, db, space.tableName)
+      throw error
+    }
+  } finally {
+    embeddingTableCreationOwners.delete(ownershipKey)
+  }
+}
+
+function recordsForSchema(records: ReadonlyArray<Record<string, unknown>>, schema: { fields: Array<{ name: string }> }): Record<string, unknown>[] {
+  const fieldNames = new Set(schema.fields.map(field => field.name))
+  return records.map((record) => {
+    const compatible: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(record)) {
+      if (value !== undefined && fieldNames.has(key)) compatible[key] = value
+    }
+    return compatible
+  })
+}
+
+async function appendCompatibleRecords(table: lancedb.Table, records: ReadonlyArray<Record<string, unknown>>): Promise<void> {
+  if (records.length === 0) return
+  await ensureCorpusKindColumn(table)
+  const schema = await table.schema()
+  await table.add(recordsForSchema(records, schema))
+}
+
+async function ensureCorpusKindColumn(table: lancedb.Table): Promise<void> {
+  const schema = await table.schema()
+  if (schema.fields.some(field => field.name === 'corpusKind')) return
+  await table.addColumns([{ name: 'corpusKind', valueSql: "'unknown'" }])
+}
+
+async function appendCanonicalRecords(
+  db: lancedb.Connection,
+  tableNames: readonly string[],
+  records: ReadonlyArray<ChunkRecord>,
+): Promise<void> {
+  if (!tableNames.includes(TABLE_NAME)) {
+    await db.createTable(TABLE_NAME, recordsForSchema(records, canonicalChunkSchema()), { schema: canonicalChunkSchema() })
+    return
+  }
+  await appendCompatibleRecords(await db.openTable(TABLE_NAME), records)
+}
+
+async function ensureTextIndex(table: lancedb.Table): Promise<void> {
+  try {
+    await table.createIndex('text', { config: lancedb.Index.fts() })
+  } catch {
+    // 已有索引和不支持 FTS 的旧 LanceDB 都不应阻断文本写入。
+  }
+}
+
+interface EmbeddingWrite {
+  space: EmbeddingSpace
+  tableName: string
+  newlyCreated: boolean
+}
+
+async function appendEmbeddingRecords(
+  projectPath: string,
+  db: lancedb.Connection,
+  registry: EmbeddingSpaceRegistry,
+  records: ReadonlyArray<ChunkRecord>,
+  dimension: number,
+  identity: Required<EmbeddingSpaceIdentity>,
+): Promise<EmbeddingWrite> {
+  const existing = matchingSpace(registry, identity, dimension)
+  if (existing) {
+    await appendCompatibleRecords(await db.openTable(existing.tableName), records)
+    return { space: existing, tableName: existing.tableName, newlyCreated: false }
+  }
+
+  const space = nextSpace(registry, identity, dimension)
+  await createOwnedEmbeddingTable(projectPath, db, space, records, embeddingChunkSchema(dimension))
+  return { space, tableName: space.tableName, newlyCreated: true }
+}
+
+/**
+ * Compensate only the physical embedding write owned by the failed operation.
+ * A newly-created generation can be dropped wholesale; a pre-existing
+ * generation must keep its table and all rows except the exact IDs appended by
+ * this operation.  Keeping ownership explicit prevents cleanup from ever
+ * dropping an old or active generation.
+ */
+async function compensateEmbeddingWrite(
+  db: lancedb.Connection,
+  write: EmbeddingWrite,
+  recordIds: readonly string[],
+): Promise<void> {
+  try {
+    const tableNames = await db.tableNames()
+    if (!tableNames.includes(write.tableName)) return
+    if (write.newlyCreated) {
+      await db.dropTable(write.tableName)
+      return
+    }
+
+    const table = await db.openTable(write.tableName)
+    for (const recordId of recordIds) {
+      await table.delete(`id = '${recordId.replace(/'/g, "''")}'`)
+    }
+  } catch (error) {
+    console.warn(`[AI Novel VectorStore] 补偿嵌入写入 ${write.tableName} 失败:`, error)
+  }
+}
+
+async function completeForCanonicalTable(
+  db: lancedb.Connection,
+  space: EmbeddingSpace,
+): Promise<boolean> {
+  const canonicalRows = await (await db.openTable(TABLE_NAME)).query().select(['id']).toArray()
+  const vectorRows = await (await db.openTable(space.tableName)).query().select(['id', 'vector']).toArray()
+  const canonicalIds = canonicalRows.map(row => (row as { id?: unknown }).id)
+  const vectorIds = vectorRows.map(row => (row as { id?: unknown }).id)
+  if (
+    canonicalRows.length !== vectorRows.length
+    || canonicalIds.some(id => typeof id !== 'string' || !id)
+    || vectorIds.some(id => typeof id !== 'string' || !id)
+    || new Set(canonicalIds).size !== canonicalIds.length
+    || new Set(vectorIds).size !== vectorIds.length
+    || vectorRows.some(row => !vectorIsUsable((row as { vector?: unknown }).vector, space.vectorDimension))
+  ) {
+    return false
+  }
+
+  const vectorIdSet = new Set(vectorIds)
+  return canonicalIds.every(id => vectorIdSet.has(id))
+}
+
+async function verifyQueryableEmbeddingSpace(
+  db: lancedb.Connection,
+  space: EmbeddingSpace,
+): Promise<boolean> {
+  const table = await db.openTable(space.tableName)
+  const rows = await table.query().select(['vector']).limit(1).toArray()
+  const probe = rows[0] && asNumberArray((rows[0] as { vector?: unknown }).vector)
+  if (!probe || !vectorIsUsable(probe, space.vectorDimension)) return false
+  // 用真实向量做一次最小查询，确保“可读行”不是只有 Arrow schema 表面成立。
+  return (await table.search(probe).limit(1).toArray()).length > 0
+}
+
+function registryWithActiveGeneration(
+  registry: EmbeddingSpaceRegistry,
+  generation: number,
+): EmbeddingSpaceRegistry {
+  return {
+    version: 1,
+    activeGeneration: generation,
+    spaces: registry.spaces.map((space) => ({
+      ...space,
+      status: space.generation === generation
+        ? 'active'
+        : space.status === 'active'
+          ? 'inactive'
+          : space.status,
+    })),
+  }
+}
+
+/**
+ * Canonical text can outgrow every existing vector generation when an import
+ * falls back to FTS-only.  Persist this conservative transition before any
+ * canonical write: a crash may lose vector acceleration, but never exposes an
+ * active generation that omits newly committed canonical rows.
+ */
+function registryWithNoActiveGeneration(registry: EmbeddingSpaceRegistry): EmbeddingSpaceRegistry {
+  return {
+    version: 1,
+    activeGeneration: null,
+    spaces: registry.spaces.map((space) => ({
+      ...space,
+      status: space.status === 'active' ? 'inactive' : space.status,
+    })),
+  }
+}
+
+async function finaliseEmbeddingWrite(
+  projectPath: string,
+  db: lancedb.Connection,
+  registry: EmbeddingSpaceRegistry,
+  write: EmbeddingWrite,
+): Promise<void> {
+  if (write.newlyCreated) registry.spaces.push(write.space)
+  const complete = await completeForCanonicalTable(db, write.space)
+  const queryable = complete && await verifyQueryableEmbeddingSpace(db, write.space)
+  if (queryable) {
+    for (const space of registry.spaces) {
+      if (space.generation === write.space.generation) {
+        space.status = 'active'
+      } else if (space.status === 'active') {
+        space.status = 'inactive'
+      }
+    }
+    registry.activeGeneration = write.space.generation
+  } else {
+    write.space.status = 'building'
+    if (registry.activeGeneration === write.space.generation) {
+      const fallback = registry.spaces.find(space => (
+        space.generation !== write.space.generation && space.status === 'active'
+      ))
+      registry.activeGeneration = fallback?.generation ?? null
+    }
+  }
+  // 仅在表已写入、可重新打开且完整性已验证后切换 active 指针。
+  writeRegistry(projectPath, registry)
+}
+
+async function canonicalRecordsForEmbeddingRebuild(
+  db: lancedb.Connection,
+): Promise<ChunkRecord[]> {
+  const rows = await (await db.openTable(TABLE_NAME)).query().toArray()
+  return rows.map(row => ({ ...(row as Record<string, unknown>) })) as ChunkRecord[]
+}
+
+function canonicalReferences(records: readonly ChunkRecord[]): Array<{ id: string; text: string }> {
+  return records.map(record => ({ id: record.id, text: record.text }))
+}
+
+/**
+ * Return canonical text without selecting an embedding generation.  The
+ * knowledge-base layer uses one of these rows as an actual-provider probe
+ * before deciding which generation may receive a write.
+ */
+export async function getCanonicalChunksForEmbeddingRebuild(
+  projectPath: string,
+): Promise<Array<{ id: string; text: string }>> {
+  // Validate persisted metadata before the caller makes any provider request.
+  // This is intentionally read-only and does not infer/register legacy state.
+  readRegistry(projectPath)
+  const db = await getConnection(projectPath)
+  if (!(await db.tableNames()).includes(TABLE_NAME)) return []
+  return canonicalReferences(await canonicalRecordsForEmbeddingRebuild(db))
+}
+
+/**
+ * Plan an explicit rebuild only after a real response established the actual
+ * vector dimension.  This is read-only: invalid probes and failed planning
+ * leave the existing registry and every vector table untouched.
+ */
+export async function planEmbeddingRebuild(
+  projectPath: string,
+  embeddingSpace: EmbeddingSpaceIdentity | undefined,
+  probeVector: unknown,
+): Promise<EmbeddingRebuildPlanResult> {
+  const validation = validateVectorsForChunks(['canonical probe'], [probeVector])
+  if (validation.error || validation.dimension === undefined) {
+    return { success: false, error: validation.error ?? 'EMBEDDING_RESPONSE_INVALID' }
+  }
+
+  const identity = normalizedIdentity(embeddingSpace, validation.dimension)
+  try {
+    const db = await getConnection(projectPath)
+    const tableNames = await db.tableNames()
+    if (!tableNames.includes(TABLE_NAME)) {
+      return {
+        success: true,
+        plan: { mode: 'up-to-date', identity, vectorDimension: validation.dimension, chunks: [] },
+      }
+    }
+
+    // Unlike ordinary reads, a failed probe/planning pass must not create a
+    // registry for a legacy table.  A registry is persisted only with a
+    // verified, successful switch below.
+    const registry = readRegistry(projectPath) ?? await inferLegacyRegistry(db, tableNames)
+    const canonical = await canonicalRecordsForEmbeddingRebuild(db)
+    const matching = matchingSpace(registry, identity, validation.dimension)
+    if (matching && tableNames.includes(matching.tableName)) {
+      const complete = await completeForCanonicalTable(db, matching)
+      const queryable = complete && await verifyQueryableEmbeddingSpace(db, matching)
+      if (queryable) {
+        return {
+          success: true,
+          plan: {
+            mode: registry.activeGeneration === matching.generation ? 'up-to-date' : 'activate',
+            identity,
+            vectorDimension: validation.dimension,
+            chunks: [],
+          },
+        }
+      }
+    }
+
+    // An incomplete or dimension-incompatible generation is never amended in
+    // place by this flow.  A separate table lets the prior active generation
+    // continue serving queries until every canonical row is verified.
+    return {
+      success: true,
+      plan: {
+        mode: 'rebuild',
+        identity,
+        vectorDimension: validation.dimension,
+        chunks: canonicalReferences(canonical),
+      },
+    }
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    }
+  }
+}
+
+/**
+ * Atomically select a previously complete generation.  It re-verifies the
+ * table before changing the registry, so a failed activation cannot demote an
+ * old active generation.
+ */
+export async function activatePlannedEmbeddingSpace(
+  projectPath: string,
+  plan: EmbeddingRebuildPlan,
+): Promise<{ success: boolean; error?: string }> {
+  return withKnowledgeSourceGate(getProjectDataRoot(projectPath), () => activatePlannedEmbeddingSpaceInternal(projectPath, plan))
+}
+
+async function activatePlannedEmbeddingSpaceInternal(
+  projectPath: string,
+  plan: EmbeddingRebuildPlan,
+): Promise<{ success: boolean; error?: string }> {
+  if (plan.mode !== 'activate') {
+    return { success: false, error: 'EMBEDDING_SPACE_PLAN_MODE_INVALID' }
+  }
+  try {
+    const db = await getConnection(projectPath)
+    const tableNames = await db.tableNames()
+    const registry = readRegistry(projectPath) ?? await inferLegacyRegistry(db, tableNames)
+    const matching = matchingSpace(registry, plan.identity, plan.vectorDimension)
+    if (!matching || !tableNames.includes(matching.tableName)) {
+      return { success: false, error: 'EMBEDDING_SPACE_CHANGED' }
+    }
+    if (!(await completeForCanonicalTable(db, matching)) || !(await verifyQueryableEmbeddingSpace(db, matching))) {
+      return { success: false, error: 'EMBEDDING_SPACE_CHANGED' }
+    }
+    writeRegistry(projectPath, registryWithActiveGeneration(registry, matching.generation))
+    return { success: true }
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/**
+ * Build a fresh generation from a full, frozen canonical snapshot.  Every
+ * validation happens before creating the new table; after creation the table
+ * is removed on every unsuccessful path.  The prior registry is only written
+ * after the new generation has passed completeness and query probes.
+ */
+export async function rebuildPlannedEmbeddingSpace(
+  projectPath: string,
+  plan: EmbeddingRebuildPlan,
+  updates: Array<{ id: string; vector: number[] }>,
+): Promise<{ success: boolean; count: number; error?: string }> {
+  return withKnowledgeSourceGate(getProjectDataRoot(projectPath), () => rebuildPlannedEmbeddingSpaceInternal(projectPath, plan, updates))
+}
+
+async function rebuildPlannedEmbeddingSpaceInternal(
+  projectPath: string,
+  plan: EmbeddingRebuildPlan,
+  updates: Array<{ id: string; vector: number[] }>,
+): Promise<{ success: boolean; count: number; error?: string }> {
+  if (plan.mode !== 'rebuild') {
+    return { success: false, count: 0, error: 'EMBEDDING_SPACE_PLAN_MODE_INVALID' }
+  }
+  if (updates.length !== plan.chunks.length || new Set(updates.map(update => update.id)).size !== updates.length) {
+    return { success: false, count: 0, error: 'EMBEDDING_SPACE_REBUILD_VECTORS_MISMATCH' }
+  }
+  const validation = validateVectorsForChunks(plan.chunks.map(chunk => chunk.id), updates.map(update => update.vector))
+  if (validation.error || !validation.vectors || validation.dimension === undefined) {
+    return { success: false, count: 0, error: validation.error ?? 'EMBEDDING_RESPONSE_INVALID' }
+  }
+  if (validation.dimension !== plan.vectorDimension) {
+    return { success: false, count: 0, error: 'EMBEDDING_RESPONSE_INVALID' }
+  }
+
+  let db: lancedb.Connection | undefined
+  let newSpace: EmbeddingSpace | undefined
+  let tableCreated = false
+  try {
+    db = await getConnection(projectPath)
+    const tableNames = await db.tableNames()
+    if (!tableNames.includes(TABLE_NAME)) {
+      return { success: false, count: 0, error: 'EMBEDDING_SPACE_CHANGED' }
+    }
+    const registry = readRegistry(projectPath) ?? await inferLegacyRegistry(db, tableNames)
+    const canonical = await canonicalRecordsForEmbeddingRebuild(db)
+    const plannedById = new Map(plan.chunks.map(chunk => [chunk.id, chunk.text]))
+    if (
+      canonical.length !== plan.chunks.length
+      || plannedById.size !== plan.chunks.length
+      || canonical.some(record => plannedById.get(record.id) !== record.text)
+    ) {
+      return { success: false, count: 0, error: 'EMBEDDING_SPACE_CHANGED' }
+    }
+    // A concurrent completed rebuild should be observed and replanned rather
+    // than appended to. An incomplete generation is intentionally left alone;
+    // this operation creates another isolated table instead of mutating it.
+    const existing = matchingSpace(registry, plan.identity, plan.vectorDimension)
+    if (
+      existing
+      && tableNames.includes(existing.tableName)
+      && await completeForCanonicalTable(db, existing)
+      && await verifyQueryableEmbeddingSpace(db, existing)
+    ) {
+      return { success: false, count: 0, error: 'EMBEDDING_SPACE_CHANGED' }
+    }
+
+    const vectorsById = new Map(updates.map((update, index) => [update.id, validation.vectors![index]]))
+    if (vectorsById.size !== canonical.length || canonical.some(record => !vectorsById.has(record.id))) {
+      return { success: false, count: 0, error: 'EMBEDDING_SPACE_REBUILD_VECTORS_MISMATCH' }
+    }
+    newSpace = nextSpace(registry, plan.identity, plan.vectorDimension)
+    const records = canonical.map(record => ({ ...record, vector: vectorsById.get(record.id)! }))
+    await createOwnedEmbeddingTable(
+      projectPath,
+      db,
+      newSpace,
+      records,
+      embeddingChunkSchema(plan.vectorDimension),
+    )
+    tableCreated = true
+
+    if (!(await completeForCanonicalTable(db, newSpace)) || !(await verifyQueryableEmbeddingSpace(db, newSpace))) {
+      throw new Error('EMBEDDING_SPACE_VERIFY_FAILED')
+    }
+    const nextRegistry = registryWithActiveGeneration({
+      version: 1,
+      activeGeneration: registry.activeGeneration,
+      spaces: [...registry.spaces.map(space => ({ ...space })), newSpace],
+    }, newSpace.generation)
+    writeRegistry(projectPath, nextRegistry)
+    return { success: true, count: records.length }
+  } catch (error) {
+    if (tableCreated && db && newSpace) {
+      try {
+        await db.dropTable(newSpace.tableName)
+      } catch (cleanupError) {
+        console.warn('[AI Novel VectorStore] 清理失败的嵌入重建表失败:', cleanupError)
+      }
+    }
+    return {
+      success: false,
+      count: 0,
+      error: error instanceof Error ? error.message : String(error),
+    }
+  }
+}
+
+async function writeDocumentInfo(
+  db: lancedb.Connection,
+  tableNames: readonly string[],
+  docInfo: DocumentInfo,
+): Promise<void> {
+  if (!tableNames.includes(DOCS_TABLE_NAME)) {
+    await db.createTable(DOCS_TABLE_NAME, [docInfo])
+    return
+  }
+  const docsTable = await db.openTable(DOCS_TABLE_NAME)
+  await ensureCorpusKindColumn(docsTable)
+  // 先追加。若后续 canonical/vector/catalog 任一步失败，旧同名文档仍然存在，
+  // 回滚也只会删除本次 docId。
+  await docsTable.add([docInfo])
+}
+
+async function pruneSupersededDocuments(
+  db: lancedb.Connection,
+  projectPath: string,
+  docInfo: DocumentInfo,
+): Promise<void> {
+  const docsTable = await db.openTable(DOCS_TABLE_NAME)
+  try {
+    const fileName = docInfo.fileName.replace(/'/g, "''")
+    const docId = docInfo.id.replace(/'/g, "''")
+    const corpusKind = docInfo.corpusKind.replace(/'/g, "''")
+    const old = await docsTable.query()
+      .filter(`\`fileName\` = '${fileName}' AND \`corpusKind\` = '${corpusKind}' AND id != '${docId}'`)
+      .select(['id']).toArray()
+    const oldIds = new Set(old.map(row => String(row.id)))
+    const knownIds = new Set((await docsTable.query().select(['id']).toArray()).map(row => String(row.id)))
+    const chunks = await db.openTable(TABLE_NAME)
+    try {
+      const sameSource = await chunks.query()
+        .filter(`\`fileName\` = '${fileName}' AND \`corpusKind\` = '${corpusKind}'`)
+        .select(['docId']).toArray()
+      for (const id of new Set(sameSource.map(row => String(row.docId)))) {
+        if (knownIds.has(id)) continue
+        const rows = await chunks.query().filter(`\`docId\` = '${id.replace(/'/g, "''")}'`).toArray()
+        if (rows.every(row => row.fileName === docInfo.fileName && row.corpusKind === docInfo.corpusKind
+          && typeof row.importedAt === 'string' && row.importedAt <= docInfo.importedAt)) oldIds.add(id)
+      }
+    } finally { chunks.close() }
+    for (const id of oldIds) {
+      if (!await removeDocumentInternal(projectPath, id)) {
+        throw new Error('SUPERSEDED_KNOWLEDGE_CLEANUP_FAILED')
+      }
+    }
+  } finally { docsTable.close() }
+}
+
+async function rollbackCurrentWrite(
+  db: lancedb.Connection,
+  chunkIds: readonly string[],
+  docId: string,
+): Promise<void> {
+  try {
+    const tableNames = await db.tableNames()
+    const escapedDocId = docId.replace(/'/g, "''")
+    for (const tableName of tableNames) {
+      try {
+        const table = await db.openTable(tableName)
+        if (tableName === DOCS_TABLE_NAME) {
+          await table.delete(`id = '${escapedDocId}'`)
+        } else if (tableName === TABLE_NAME || tableName.startsWith(EMBEDDING_TABLE_PREFIX)) {
+          // 以本次生成的 chunk id 精确删除，避免触碰同一 docId 的历史数据。
+          for (const chunkId of chunkIds) {
+            await table.delete(`id = '${chunkId.replace(/'/g, "''")}'`)
+          }
+        }
+      } catch (error) {
+        console.warn(`[AI Novel VectorStore] 回滚 ${tableName} 的本次写入失败:`, error)
+      }
+    }
+  } catch (error) {
+    console.warn('[AI Novel VectorStore] 读取回滚目标失败:', error)
+  }
+}
+
+// ===== 核心操作 =====
+
+/**
+ * 写入文档块到 LanceDB。
+ * 文本先后均可独立检索；带向量时仅写入匹配的版本化嵌入空间。
+ */
+export async function addChunks(
+  projectPath: string,
+  docId: string,
+  fileName: string,
+  chunks: string[],
+  vectors?: number[][],
+  filePath?: string,
+  metadata?: {
+    chapterNumber?: number
+    chapterTitle?: string
+    corpusKind?: KnowledgeCorpusKind
+    replacementMode?: 'by-file-name' | 'stable-id'
+  },
+  embeddingSpace?: EmbeddingSpaceIdentity,
+): Promise<{ success: boolean; chunkCount: number; error?: string }> {
+  return withKnowledgeSourceGate(getProjectDataRoot(projectPath), () => addChunksInternal(projectPath, docId, fileName, chunks, vectors, filePath, metadata, embeddingSpace))
+}
+
+async function addChunksInternal(
+  projectPath: string,
+  docId: string,
+  fileName: string,
+  chunks: string[],
+  vectors?: number[][],
+  filePath?: string,
+  metadata?: {
+    chapterNumber?: number
+    chapterTitle?: string
+    corpusKind?: KnowledgeCorpusKind
+    replacementMode?: 'by-file-name' | 'stable-id'
+  },
+  embeddingSpace?: EmbeddingSpaceIdentity,
+): Promise<{ success: boolean; chunkCount: number; error?: string }> {
+  if (!validateChunks(chunks)) {
+    return { success: false, chunkCount: 0, error: 'KNOWLEDGE_BASE_CHUNKS_INVALID' }
+  }
+  const validation = validateVectorsForChunks(chunks, vectors)
+  if (validation.error) {
+    return { success: false, chunkCount: 0, error: validation.error }
+  }
+
+  let db: lancedb.Connection | undefined
+  let rollbackRequired = false
+  let chunkIds: string[] = []
+  let embeddingWrite: EmbeddingWrite | undefined
+  try {
+    db = await getConnection(projectPath)
+    const now = new Date().toISOString()
+    const corpusKind = metadata?.corpusKind ?? 'unknown'
+    const canonicalRecords: ChunkRecord[] = chunks.map((text, index) => ({
+      id: randomUUID(),
+      docId,
+      fileName,
+      text,
+      chunkIndex: index,
+      totalChunks: chunks.length,
+      importedAt: now,
+      chapterNumber: metadata?.chapterNumber,
+      chapterTitle: metadata?.chapterTitle,
+      corpusKind,
+    }))
+    chunkIds = canonicalRecords.map(record => record.id)
+    const tableNames = await db.tableNames()
+    const registry = await loadOrRegisterLegacyRegistry(projectPath, db, tableNames)
+
+    if (validation.vectors && validation.dimension !== undefined) {
+      const identity = normalizedIdentity(embeddingSpace, validation.dimension)
+      const existingSpace = matchingSpace(registry, identity, validation.dimension)
+      const canonicalHasRows = tableNames.includes(TABLE_NAME)
+        && await (await db.openTable(TABLE_NAME)).countRows() > 0
+      // 普通导入不能把新模型当作“顺手重建”。存在任何已知空间，或已有仅全文
+      // 文本但尚未显式回填时，调用方必须进入明确的 rebuild/backfill 流程。
+      if (!existingSpace && (registry.spaces.length > 0 || canonicalHasRows)) {
+        const active = activeSpace(registry)
+        console.warn('[AI Novel VectorStore] 导入的嵌入空间与现有索引不兼容，需要先显式重建', {
+          incoming: { ...identity, vectorDimension: validation.dimension },
+          active: active ? { modelFingerprint: active.modelFingerprint, vectorDimension: active.vectorDimension } : 'fts-only',
+        })
+        return {
+          success: false,
+          chunkCount: 0,
+          error: 'EMBEDDING_SPACE_REINDEX_REQUIRED',
+        }
+      }
+      const vectorRecords = canonicalRecords.map((record, index) => ({
+        ...record,
+        vector: validation.vectors![index],
+      }))
+      embeddingWrite = await appendEmbeddingRecords(
+        projectPath,
+        db,
+        registry,
+        vectorRecords,
+        validation.dimension,
+        identity,
+      )
+    }
+
+    const docInfo: DocumentInfo = {
+      id: docId,
+      fileName,
+      importedAt: now,
+      chunkCount: chunks.length,
+      filePath: filePath || '',
+      corpusKind,
+    }
+    if (!validation.vectors && registry.activeGeneration !== null) {
+      // This must precede document/canonical writes. Do not restore the old
+      // active pointer on a later write failure: it may no longer cover a
+      // committed canonical row, whereas FTS remains authoritative and safe.
+      writeRegistry(projectPath, registryWithNoActiveGeneration(registry))
+    }
+    rollbackRequired = true
+    await writeDocumentInfo(db, tableNames, docInfo)
+
+    await appendCanonicalRecords(db, await db.tableNames(), canonicalRecords)
+    const canonicalTable = await db.openTable(TABLE_NAME)
+    await ensureTextIndex(canonicalTable)
+
+    if (embeddingWrite) {
+      await finaliseEmbeddingWrite(projectPath, db, registry, embeddingWrite)
+    }
+
+    // The new document is durable. A partial old-document cleanup must not
+    // roll it back and leave the user with no complete copy.
+    rollbackRequired = false
+
+    if (metadata?.replacementMode !== 'stable-id') {
+      try { await pruneSupersededDocuments(db, projectPath, docInfo) }
+      catch (error) { console.warn('[AI Novel VectorStore] 新文档已保存，旧文档清理未完成:', error) }
+    }
+
+    return { success: true, chunkCount: chunks.length }
+  } catch (error) {
+    if (rollbackRequired && db) {
+      await rollbackCurrentWrite(db, chunkIds, docId)
+    }
+    if (rollbackRequired && db && embeddingWrite) {
+      await compensateEmbeddingWrite(db, embeddingWrite, chunkIds)
+    }
+    console.error('[AI Novel VectorStore] 写入失败:', error)
+    return { success: false, chunkCount: 0, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/** Reindex the existing identity so chapter outbox references remain valid. */
+export async function replaceDocumentChunks(projectPath: string, docId: string, chunks: string[], copy: KnowledgeCopy): Promise<{ success: boolean; chunkCount: number; error?: string }> {
+  return withKnowledgeSourceGate(getProjectDataRoot(projectPath), async () => {
+    const opened: Array<{ table: lancedb.Table; version: number }> = []
+    try {
+      const db = await getConnection(projectPath)
+      const names = await db.tableNames()
+      const registry = await loadOrRegisterLegacyRegistry(projectPath, db, names)
+      for (const name of [TABLE_NAME, DOCS_TABLE_NAME, ...names.filter(name => name.startsWith(EMBEDDING_TABLE_PREFIX))]) {
+        const table = await db.openTable(name)
+        opened.push({ table, version: await table.version() })
+      }
+      const [canonical, documents, ...vectors] = opened
+      const filter = `\`docId\` = '${docId.replace(/'/g, "''")}'`
+      const previous = await canonical.table.query().filter(filter).toArray()
+      if (!previous.length || !validateChunks(chunks)) throw new Error('KNOWLEDGE_DOCUMENT_CHUNKS_MISSING')
+      const records = chunks.map((text, chunkIndex) => ({ ...previous[0], id: randomUUID(), text, chunkIndex, totalChunks: chunks.length }))
+      writeRegistry(projectPath, registryWithNoActiveGeneration(registry))
+      for (const { table } of vectors) await table.delete(filter)
+      await canonical.table.mergeInsert('id').whenNotMatchedInsertAll()
+        .whenNotMatchedBySourceDelete({ where: filter })
+        .execute(recordsForSchema(records, await canonical.table.schema()))
+      await documents.table.update({ where: `id = '${docId.replace(/'/g, "''")}'`, values: { chunkCount: chunks.length } })
+      writeKnowledgeCopy(getProjectDataRoot(projectPath), docId, { ...copy, indexedHash: contentHash(copy.content), indexDirty: false })
+      return { success: true, chunkCount: chunks.length }
+    } catch (error) {
+      for (const { table, version } of opened.reverse()) {
+        try { await table.checkout(version); await table.restore() }
+        catch (rollbackError) { console.error('[AI Novel VectorStore] 恢复重建前索引失败:', rollbackError) }
+      }
+      return { success: false, chunkCount: 0, error: error instanceof Error ? error.message : String(error) }
+    } finally { for (const { table } of opened) table.close() }
+  })
+}
+
+/** 删除文档及其在所有嵌入空间中的块，不删除任何表。 */
+export async function removeDocument(projectPath: string, docId: string): Promise<boolean> {
+  return withKnowledgeSourceGate(getProjectDataRoot(projectPath), () => removeDocumentInternal(projectPath, docId))
+}
+
+async function removeDocumentInternal(projectPath: string, docId: string): Promise<boolean> {
+  try {
+    const db = await getConnection(projectPath)
+    const tableNames = await db.tableNames()
+    const registry = await loadOrRegisterLegacyRegistry(projectPath, db, tableNames)
+    const escapedId = docId.replace(/'/g, "''")
+    const targets = new Set<string>([
+      TABLE_NAME,
+      ...tableNames.filter(tableName => tableName.startsWith(EMBEDDING_TABLE_PREFIX)),
+      ...registry.spaces.map(space => space.tableName),
+    ])
+    for (const tableName of targets) {
+      if (tableNames.includes(tableName)) await (await db.openTable(tableName)).delete(`\`docId\` = '${escapedId}'`)
+    }
+    // LanceDB cannot atomically delete across physical generations.  A retry is
+    // safe only after proving that every registered and orphan generation has
+    // reached the same zero-row postcondition.
+    const remainingTableNames = await db.tableNames()
+    const remainingTargets = new Set<string>([
+      TABLE_NAME,
+      ...remainingTableNames.filter(tableName => tableName.startsWith(EMBEDDING_TABLE_PREFIX)),
+      ...registry.spaces.map(space => space.tableName),
+    ])
+    for (const tableName of remainingTargets) {
+      if (!remainingTableNames.includes(tableName)) continue
+      const rows = await (await db.openTable(tableName)).query()
+        .filter(`\`docId\` = '${escapedId}'`)
+        .limit(1)
+        .toArray()
+      if (rows.length > 0) return false
+    }
+    if (remainingTableNames.includes(DOCS_TABLE_NAME)) {
+      await (await db.openTable(DOCS_TABLE_NAME)).delete(`id = '${escapedId}'`)
+    }
+    if (remainingTableNames.includes(DOCS_TABLE_NAME)) {
+      const rows = await (await db.openTable(DOCS_TABLE_NAME)).query()
+        .filter(`id = '${escapedId}'`)
+        .limit(1)
+        .toArray()
+      if (rows.length > 0) return false
+    }
+    fs.rmSync(knowledgeCopyPath(getProjectDataRoot(projectPath), docId), { force: true })
+    return true
+  } catch (error) {
+    console.error('[AI Novel VectorStore] 删除失败:', error)
+    return false
+  }
+}
+
+/**
+ * 清空整个项目知识库。该函数是用户明确触发的清空操作，因而会删除所有代际。
+ */
+export async function clearAll(projectPath: string): Promise<boolean> {
+  return withKnowledgeSourceGate(getProjectDataRoot(projectPath), () => clearAllInternal(projectPath))
+}
+
+async function clearAllInternal(projectPath: string): Promise<boolean> {
+  try {
+    const db = await getConnection(projectPath)
+    const tableNames = await db.tableNames()
+    for (const tableName of tableNames) {
+      if (tableName === TABLE_NAME || tableName === DOCS_TABLE_NAME || tableName.startsWith(EMBEDDING_TABLE_PREFIX)) {
+        await db.dropTable(tableName)
+      }
+    }
+    const filePath = registryPath(projectPath)
+    if (fs.existsSync(filePath)) fs.rmSync(filePath, { force: true })
+    const copies = path.join(getProjectDataRoot(projectPath), 'knowledge-copies')
+    if (fs.existsSync(copies)) {
+      const stat = fs.lstatSync(copies)
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('KNOWLEDGE_COPY_UNSAFE_PATH')
+      fs.rmSync(copies, { recursive: true })
+    }
+    return true
+  } catch (error) {
+    console.error('[AI Novel VectorStore] 清空知识库失败:', error)
+    return false
+  }
+}
+
+function activeSpace(registry: EmbeddingSpaceRegistry): EmbeddingSpace | undefined {
+  return registry.activeGeneration === null
+    ? undefined
+    : registry.spaces.find(space => space.generation === registry.activeGeneration)
+}
+
+function requestMatchesActiveSpace(
+  space: EmbeddingSpace,
+  queryVector: number[],
+  identity?: EmbeddingSpaceIdentity,
+): boolean {
+  if (!vectorIsUsable(queryVector, space.vectorDimension)) return false
+  if (!identity) return true // 保持既有 vector-store 直接调用的兼容性。
+  const requested = normalizedIdentity(identity, queryVector.length)
+  return space.modelFingerprint === requested.modelFingerprint && space.distanceMetric === requested.distanceMetric
+}
+
+async function tableSupportsField(table: lancedb.Table, fieldName: string): Promise<boolean> {
+  return (await table.schema()).fields.some(field => field.name === fieldName)
+}
+
+function excludedCorpusFilter(excludedCorpusKinds: readonly KnowledgeCorpusKind[]): string | undefined {
+  const values = [...new Set(excludedCorpusKinds)]
+  return values.length > 0
+    ? `\`corpusKind\` NOT IN (${values.map(value => `'${value}'`).join(', ')})`
+    : undefined
+}
+
+/** 统一检索入口 — 仅对当前 active 且身份匹配的空间使用向量，其他情况安全降级 FTS。 */
+export async function search(
+  projectPath: string,
+  queryText: string,
+  queryVector?: number[],
+  topK: number = 5,
+  embeddingSpace?: EmbeddingSpaceIdentity,
+  excludedCorpusKinds: readonly KnowledgeCorpusKind[] = [],
+): Promise<SearchResult[]> {
+  return searchWithScope(
+    projectPath,
+    queryText,
+    queryVector,
+    topK,
+    undefined,
+    embeddingSpace,
+    excludedCorpusKinds,
+  )
+}
+
+/** 支持章节范围限定的检索入口。 */
+export async function searchWithScope(
+  projectPath: string,
+  queryText: string,
+  queryVector?: number[],
+  topK: number = 5,
+  chapterScope?: [number, number],
+  embeddingSpace?: EmbeddingSpaceIdentity,
+  excludedCorpusKinds: readonly KnowledgeCorpusKind[] = [],
+): Promise<SearchResult[]> {
+  return withKnowledgeSourceGate(getProjectDataRoot(projectPath), () => searchWithScopeInternal(projectPath, queryText, queryVector, topK, chapterScope, embeddingSpace, excludedCorpusKinds))
+}
+
+async function searchWithScopeInternal(
+  projectPath: string,
+  queryText: string,
+  queryVector?: number[],
+  topK: number = 5,
+  chapterScope?: [number, number],
+  embeddingSpace?: EmbeddingSpaceIdentity,
+  excludedCorpusKinds: readonly KnowledgeCorpusKind[] = [],
+): Promise<SearchResult[]> {
+  let documentsTable: lancedb.Table | undefined
+  try {
+    const db = await getConnection(projectPath)
+    const tableNames = await db.tableNames()
+    if (!tableNames.includes(TABLE_NAME)) return []
+    documentsTable = tableNames.includes(DOCS_TABLE_NAME) ? await db.openTable(DOCS_TABLE_NAME) : undefined
+    const staleDocIds = documentsTable
+      ? (await documentsTable.query().toArray())
+          .filter(row => !isDocumentCopyIndexCurrent(getProjectDataRoot(projectPath), String(row.id), row.filePath))
+          .map(row => String(row.id))
+      : []
+    const currentCopyFilter = staleDocIds.length
+      ? staleDocIds.map(id => `\`docId\` != '${id.replace(/'/g, "''")}'`).join(' AND ')
+      : undefined
+
+    let scopeFilter: string | undefined
+    if (chapterScope) {
+      const [from, to] = chapterScope
+      scopeFilter = `\`chapterNumber\` >= ${from} AND \`chapterNumber\` <= ${to}`
+    }
+
+    if (queryVector && vectorIsUsable(queryVector)) {
+      try {
+        const registry = await loadOrRegisterLegacyRegistry(projectPath, db, tableNames)
+        const active = activeSpace(registry)
+        if (active && tableNames.includes(active.tableName) && requestMatchesActiveSpace(active, queryVector, embeddingSpace)) {
+          const vectorTable = await db.openTable(active.tableName)
+          try {
+          let query = vectorTable.search(queryVector).limit(topK)
+          const vectorFilters: string[] = []
+          if (scopeFilter && await tableSupportsField(vectorTable, 'chapterNumber')) {
+            vectorFilters.push(scopeFilter)
+          }
+          const corpusFilter = excludedCorpusFilter(excludedCorpusKinds)
+          if (corpusFilter && await tableSupportsField(vectorTable, 'corpusKind')) {
+            vectorFilters.push(corpusFilter)
+          }
+          if (currentCopyFilter) vectorFilters.push(currentCopyFilter)
+          if (vectorFilters.length > 0) query = query.where(vectorFilters.join(' AND '))
+          const results = await query.toArray()
+          if (results.length > 0) {
+            return results.map((row: { text: string; _distance?: number; fileName: string }) => ({
+              text: row.text,
+              score: row._distance != null ? 1 / (1 + row._distance) : 0.5,
+              fileName: row.fileName,
+            }))
+          }
+          } finally { vectorTable.close() }
+        }
+      } catch (error) {
+        console.warn('[AI Novel VectorStore] 向量检索降级为全文检索:', error)
+      }
+    }
+
+    let canonicalTable: lancedb.Table | undefined
+    try {
+      canonicalTable = await db.openTable(TABLE_NAME)
+      const rawTerms = queryText.match(/[\p{L}\p{N}-]+/gu) ?? []
+      const meaningfulTerms = rawTerms.filter(term => Array.from(term).length >= 2)
+      const searchTerms = [...new Map(
+        (meaningfulTerms.length > 0 ? meaningfulTerms : rawTerms)
+          .map(term => [term.toLocaleLowerCase(), term]),
+      ).values()].slice(0, 8)
+      const textFilter = searchTerms.length > 0
+        ? `(${searchTerms
+            .map(term => `text LIKE '%${term.replace(/'/g, "''")}%'`)
+            .join(' OR ')})`
+        : "text LIKE '%%'"
+      const filters = [textFilter]
+      if (scopeFilter && await tableSupportsField(canonicalTable, 'chapterNumber')) {
+        filters.push(scopeFilter)
+      }
+      const corpusFilter = excludedCorpusFilter(excludedCorpusKinds)
+      if (corpusFilter && await tableSupportsField(canonicalTable, 'corpusKind')) {
+        filters.push(corpusFilter)
+      }
+      if (currentCopyFilter) filters.push(currentCopyFilter)
+      const filter = filters.join(' AND ')
+      const results = await canonicalTable.query().filter(filter).toArray()
+      const normalizedTerms = searchTerms.map(term => term.toLocaleLowerCase())
+      const ftsResults = results
+        .map((row: { text: string; fileName: string }) => ({
+          result: { text: row.text, score: 0.5, fileName: row.fileName },
+          relevance: normalizedTerms.reduce((score, term, index) => (
+            row.text.toLocaleLowerCase().includes(term)
+              ? score + normalizedTerms.length - index
+              : score
+          ), 0),
+        }))
+        .sort((left, right) => right.relevance - left.relevance)
+        .map(candidate => candidate.result)
+      const uniqueResults = new Map<string, SearchResult>()
+      for (const result of ftsResults) {
+        const key = JSON.stringify([result.fileName, result.text])
+        if (!uniqueResults.has(key)) uniqueResults.set(key, result)
+      }
+      return [...uniqueResults.values()].slice(0, topK)
+    } catch (error) {
+      console.warn('[AI Novel VectorStore] 纯文本检索失败:', error)
+      return []
+    } finally {
+      canonicalTable?.close()
+    }
+  } catch (error) {
+    console.error('[AI Novel VectorStore] 检索失败:', error)
+    return []
+  } finally { documentsTable?.close() }
+}
+
+export async function listDocuments(projectPath: string): Promise<DocumentInfo[]> {
+  return withKnowledgeSourceGate(getProjectDataRoot(projectPath), () => listDocumentsInternal(projectPath))
+}
+
+const PORTABLE_KNOWLEDGE_VERSION = 1 as const
+const PORTABLE_KNOWLEDGE_DATE = '1970-01-01T00:00:00.000Z'
+
+function exactPortableKeys(value: Record<string, unknown>, expected: readonly string[]): void {
+  const actual = Object.keys(value).sort()
+  const wanted = [...expected].sort()
+  if (actual.length !== wanted.length || actual.some((key, index) => key !== wanted[index])) {
+    throw new Error('PORTABLE_KNOWLEDGE_INVALID')
+  }
+}
+
+function portableRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('PORTABLE_KNOWLEDGE_INVALID')
+  return value as Record<string, unknown>
+}
+
+function portableText(value: unknown): string {
+  if (typeof value !== 'string' || value.length === 0 || value.includes('\0')) throw new Error('PORTABLE_KNOWLEDGE_INVALID')
+  return value
+}
+
+function portableFileName(value: unknown): string {
+  const fileName = portableText(value)
+  const normalized = fileName.normalize('NFKC')
+  if (fileName.length > 512 || path.posix.isAbsolute(normalized) || path.win32.isAbsolute(normalized)
+    || normalized.includes('/') || normalized.includes('\\') || /^[a-z]:/iu.test(normalized)
+    || /[<>:"|?*]/u.test(normalized) || normalized.endsWith('.') || normalized.endsWith(' ')
+    || [...normalized].some(character => character.charCodeAt(0) <= 31)
+    || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu.test(normalized)) {
+    throw new Error('PORTABLE_KNOWLEDGE_INVALID')
+  }
+  return fileName
+}
+
+function portableCorpusKind(value: unknown): KnowledgeCorpusKind {
+  if (value !== 'reference' && value !== 'project-knowledge' && value !== 'unknown') {
+    throw new Error('PORTABLE_KNOWLEDGE_INVALID')
+  }
+  return value
+}
+
+/** Strict non-executable projection: paths, vectors and embedding identities are not accepted. */
+export function parsePortableKnowledgeSnapshot(value: unknown): PortableKnowledgeSnapshot {
+  const source = portableRecord(value)
+  exactPortableKeys(source, ['version', 'documents'])
+  if (source.version !== PORTABLE_KNOWLEDGE_VERSION || !Array.isArray(source.documents)) {
+    throw new Error('PORTABLE_KNOWLEDGE_INVALID')
+  }
+  const documentIds = new Set<string>()
+  const documents = source.documents.map((item) => {
+    const document = portableRecord(item)
+    exactPortableKeys(document, document.copy === undefined
+      ? ['docId', 'fileName', 'corpusKind', 'chunks']
+      : ['docId', 'fileName', 'corpusKind', 'chunks', 'copy'])
+    const docId = portableText(document.docId)
+    const fileName = portableFileName(document.fileName)
+    const corpusKind = portableCorpusKind(document.corpusKind)
+    if (documentIds.has(docId) || !Array.isArray(document.chunks) || document.chunks.length === 0) {
+      throw new Error('PORTABLE_KNOWLEDGE_INVALID')
+    }
+    documentIds.add(docId)
+    const chunks = document.chunks.map((item, index) => {
+      const chunk = portableRecord(item)
+      exactPortableKeys(chunk, ['chunkIndex', 'text'])
+      if (chunk.chunkIndex !== index) throw new Error('PORTABLE_KNOWLEDGE_INVALID')
+      return { chunkIndex: index, text: portableText(chunk.text) }
+    })
+    let copy: KnowledgeCopy | undefined
+    if (document.copy !== undefined) {
+      const value = portableRecord(document.copy)
+      exactPortableKeys(value, ['content', 'indexedHash', 'edited', 'indexDirty'])
+      if (typeof value.content !== 'string' || typeof value.indexedHash !== 'string'
+        || !/^[a-f0-9]{64}$/u.test(value.indexedHash)
+        || typeof value.edited !== 'boolean' || typeof value.indexDirty !== 'boolean'
+        || (!value.indexDirty && contentHash(value.content) !== value.indexedHash)) {
+        throw new Error('PORTABLE_KNOWLEDGE_INVALID')
+      }
+      copy = { content: value.content, indexedHash: value.indexedHash, edited: value.edited, indexDirty: value.indexDirty }
+    }
+    return { docId, fileName, corpusKind, chunks, ...(copy ? { copy } : {}) }
+  })
+  documents.sort((left, right) => left.docId.localeCompare(right.docId))
+  return { version: PORTABLE_KNOWLEDGE_VERSION, documents }
+}
+
+export function serializePortableKnowledgeSnapshot(snapshot: PortableKnowledgeSnapshot): Buffer {
+  return Buffer.from(`${JSON.stringify(parsePortableKnowledgeSnapshot(snapshot))}\n`, 'utf8')
+}
+
+async function readPortableKnowledgeSnapshotInternal(projectStorageRoot: string): Promise<PortableKnowledgeSnapshot> {
+  const dbPath = path.join(projectStorageRoot, 'lancedb')
+  if (!fs.existsSync(dbPath)) return { version: PORTABLE_KNOWLEDGE_VERSION, documents: [] }
+  const assertPhysicalTree = (entry: string): void => {
+    const info = fs.lstatSync(entry, { bigint: true })
+    if (info.isSymbolicLink() || path.resolve(fs.realpathSync.native(entry)) !== path.resolve(entry)) {
+      throw new Error('PORTABLE_KNOWLEDGE_INVALID')
+    }
+    if (info.isDirectory()) {
+      for (const name of fs.readdirSync(entry)) assertPhysicalTree(path.join(entry, name))
+    } else if (!info.isFile() || info.nlink !== 1n) throw new Error('PORTABLE_KNOWLEDGE_INVALID')
+  }
+  const storageInfo = fs.lstatSync(projectStorageRoot)
+  if (!storageInfo.isDirectory() || storageInfo.isSymbolicLink()
+    || path.resolve(fs.realpathSync.native(projectStorageRoot)) !== path.resolve(projectStorageRoot)) {
+    throw new Error('PORTABLE_KNOWLEDGE_INVALID')
+  }
+  assertPhysicalTree(dbPath)
+  const db = await lancedb.connect(dbPath)
+  try {
+    const tableNames = await db.tableNames()
+    const hasDocuments = tableNames.includes(DOCS_TABLE_NAME)
+    const hasChunks = tableNames.includes(TABLE_NAME)
+    if (!hasDocuments && !hasChunks) return { version: PORTABLE_KNOWLEDGE_VERSION, documents: [] }
+    if (!hasDocuments || !hasChunks) throw new Error('PORTABLE_KNOWLEDGE_INVALID')
+    const documentsTable = await db.openTable(DOCS_TABLE_NAME)
+    const chunksTable = await db.openTable(TABLE_NAME)
+    try {
+      const documentRows = await documentsTable.query().toArray()
+      const chunkRows = await chunksTable.query()
+        .select(['docId', 'fileName', 'text', 'chunkIndex', 'totalChunks', 'corpusKind']).toArray()
+      const grouped = new Map<string, Array<{ chunkIndex: number; text: string; fileName: string; corpusKind: KnowledgeCorpusKind; totalChunks: number }>>()
+      for (const row of chunkRows as Array<Record<string, unknown>>) {
+        const docId = portableText(row.docId)
+        const chunkIndex = row.chunkIndex
+        const totalChunks = row.totalChunks
+        if (!Number.isSafeInteger(chunkIndex) || (chunkIndex as number) < 0
+          || !Number.isSafeInteger(totalChunks) || (totalChunks as number) <= 0) throw new Error('PORTABLE_KNOWLEDGE_INVALID')
+        const values = grouped.get(docId) ?? []
+        values.push({ chunkIndex: chunkIndex as number, totalChunks: totalChunks as number,
+          text: portableText(row.text), fileName: portableFileName(row.fileName), corpusKind: portableCorpusKind(row.corpusKind) })
+        grouped.set(docId, values)
+      }
+      const documents = (documentRows as Array<Record<string, unknown>>).map((row) => {
+        const docId = portableText(row.id)
+        const fileName = portableFileName(row.fileName)
+        const corpusKind = portableCorpusKind(row.corpusKind)
+        const chunkCount = row.chunkCount
+        const rows = grouped.get(docId) ?? []
+        if (!Number.isSafeInteger(chunkCount) || chunkCount !== rows.length || rows.length === 0) {
+          throw new Error('PORTABLE_KNOWLEDGE_INVALID')
+        }
+        rows.sort((left, right) => left.chunkIndex - right.chunkIndex)
+        if (rows.some((chunk, index) => chunk.chunkIndex !== index || chunk.totalChunks !== rows.length
+          || chunk.fileName !== fileName || chunk.corpusKind !== corpusKind)) throw new Error('PORTABLE_KNOWLEDGE_INVALID')
+        grouped.delete(docId)
+        let copy: KnowledgeCopy | undefined
+        if (typeof row.filePath === 'string' && row.filePath.startsWith(KNOWLEDGE_COPY_MARKER)) {
+          copy = readKnowledgeCopy(projectStorageRoot, docId) ?? undefined
+          if (!copy) throw new Error('PORTABLE_KNOWLEDGE_INVALID')
+        }
+        return { docId, fileName, corpusKind, chunks: rows.map(chunk => ({ chunkIndex: chunk.chunkIndex, text: chunk.text })), ...(copy ? { copy } : {}) }
+      })
+      if (grouped.size > 0) throw new Error('PORTABLE_KNOWLEDGE_INVALID')
+      const snapshot = parsePortableKnowledgeSnapshot({ version: PORTABLE_KNOWLEDGE_VERSION, documents })
+      assertPhysicalTree(dbPath)
+      return snapshot
+    } finally {
+      documentsTable.close()
+      chunksTable.close()
+    }
+  } finally { db.close() }
+}
+
+/** Reads documents and ordered canonical text under the same source mutation gate. */
+export async function readPortableKnowledgeSnapshot(projectStorageRoot: string): Promise<PortableKnowledgeSnapshot> {
+  return withKnowledgeSourceGate(projectStorageRoot, () => readPortableKnowledgeSnapshotInternal(projectStorageRoot))
+}
+
+/** Creates only canonical text tables. Embeddings and machine-local registry state remain stale/rebuildable. */
+export async function restorePortableKnowledgeSnapshot(
+  projectStorageRoot: string,
+  value: unknown,
+): Promise<PortableKnowledgeSnapshot> {
+  const snapshot = parsePortableKnowledgeSnapshot(value)
+  return withKnowledgeSourceGate(projectStorageRoot, async () => {
+    const dbPath = path.join(projectStorageRoot, 'lancedb')
+    if (fs.existsSync(dbPath) || fs.existsSync(path.join(projectStorageRoot, EMBEDDING_REGISTRY_FILE))) {
+      throw new Error('PORTABLE_KNOWLEDGE_TARGET_EXISTS')
+    }
+    if (snapshot.documents.length === 0) return snapshot
+    fs.mkdirSync(dbPath, { recursive: false })
+    const db = await lancedb.connect(dbPath)
+    try {
+      const documentRows: DocumentInfo[] = snapshot.documents.map(document => ({
+        id: document.docId,
+        fileName: document.fileName,
+        importedAt: PORTABLE_KNOWLEDGE_DATE,
+        chunkCount: document.chunks.length,
+        filePath: document.copy ? `${KNOWLEDGE_COPY_MARKER}${document.docId}` : '',
+        corpusKind: document.corpusKind,
+      }))
+      const chunkRows: ChunkRecord[] = snapshot.documents.flatMap(document => document.chunks.map(chunk => ({
+        id: `portable:${createHash('sha256').update(`${document.docId}\0${chunk.chunkIndex}\0${chunk.text}`).digest('hex')}`,
+        docId: document.docId,
+        fileName: document.fileName,
+        text: chunk.text,
+        chunkIndex: chunk.chunkIndex,
+        totalChunks: document.chunks.length,
+        importedAt: PORTABLE_KNOWLEDGE_DATE,
+        corpusKind: document.corpusKind,
+      })))
+      await db.createTable(DOCS_TABLE_NAME, documentRows)
+      const chunks = await db.createTable(TABLE_NAME, recordsForSchema(chunkRows, canonicalChunkSchema()), { schema: canonicalChunkSchema() })
+      await ensureTextIndex(chunks)
+      chunks.close()
+    } finally { db.close() }
+    for (const document of snapshot.documents) {
+      if (document.copy) writeKnowledgeCopy(projectStorageRoot, document.docId, document.copy)
+    }
+    const rebuilt = await readPortableKnowledgeSnapshotInternal(projectStorageRoot)
+    if (serializePortableKnowledgeSnapshot(rebuilt).compare(serializePortableKnowledgeSnapshot(snapshot)) !== 0) {
+      throw new Error('PORTABLE_KNOWLEDGE_REBUILD_FAILED')
+    }
+    return rebuilt
+  })
+}
+
+export async function verifyPortableKnowledgeSnapshot(projectStorageRoot: string, value: unknown): Promise<boolean> {
+  const expected = serializePortableKnowledgeSnapshot(parsePortableKnowledgeSnapshot(value))
+  return withKnowledgeSourceGate(projectStorageRoot, async () => (
+    expected.compare(serializePortableKnowledgeSnapshot(await readPortableKnowledgeSnapshotInternal(projectStorageRoot))) === 0
+  ))
+}
+
+async function listDocumentsInternal(projectPath: string): Promise<DocumentInfo[]> {
+  try {
+    const db = await getConnection(projectPath)
+    if (!(await db.tableNames()).includes(DOCS_TABLE_NAME)) return []
+    const table = await db.openTable(DOCS_TABLE_NAME)
+    await ensureCorpusKindColumn(table)
+    const rows = await table.query().toArray()
+    return rows.map((row: { id: string; fileName: string; importedAt: string; chunkCount: number; filePath?: string; corpusKind?: KnowledgeCorpusKind }) => ({
+      id: row.id,
+      fileName: row.fileName,
+      importedAt: row.importedAt,
+      chunkCount: row.chunkCount,
+      filePath: row.filePath || '',
+      corpusKind: row.corpusKind ?? 'unknown',
+    }))
+  } catch {
+    return []
+  }
+}
+
+export interface DocumentIntegrity {
+  docId: string
+  corpusKind: KnowledgeCorpusKind
+  chunkCount: number
+  chunkSetHash: string
+  complete: boolean
+  embeddingGenerations: Array<{
+    generation: number | null
+    tableName: string
+    status: EmbeddingSpaceStatus | 'unregistered'
+    chunkCount: number
+    complete: boolean
+  }>
+}
+
+export function hashCanonicalChunkSet(chunks: readonly string[]): string {
+  return createHash('sha256').update(JSON.stringify(chunks), 'utf8').digest('hex')
+}
+
+/** Validate both the document commit row and every canonical chunk for a stable import. */
+export async function getDocumentIntegrity(
+  projectPath: string,
+  docId: string,
+): Promise<DocumentIntegrity | null> {
+  return withKnowledgeSourceGate(getProjectDataRoot(projectPath), () => getDocumentIntegrityInternal(projectPath, docId))
+}
+
+async function getDocumentIntegrityInternal(
+  projectPath: string,
+  docId: string,
+): Promise<DocumentIntegrity | null> {
+  const db = await getConnection(projectPath)
+  const tableNames = await db.tableNames()
+  const escapedId = docId.replace(/'/g, "''")
+  let chunkRows: Array<{ id: string; chunkIndex: number; totalChunks: number; text: string; corpusKind?: KnowledgeCorpusKind }> = []
+  if (tableNames.includes(TABLE_NAME)) {
+    const chunksTable = await db.openTable(TABLE_NAME)
+    await ensureCorpusKindColumn(chunksTable)
+    chunkRows = await chunksTable.query()
+      .filter(`\`docId\` = '${escapedId}'`)
+      .select(['id', 'chunkIndex', 'totalChunks', 'text', 'corpusKind'])
+      .toArray() as typeof chunkRows
+  }
+  let documentRows: Array<{ id: string; chunkCount: number; corpusKind?: KnowledgeCorpusKind }> = []
+  if (tableNames.includes(DOCS_TABLE_NAME)) {
+    const docsTable = await db.openTable(DOCS_TABLE_NAME)
+    await ensureCorpusKindColumn(docsTable)
+    documentRows = await docsTable.query()
+      .filter(`id = '${escapedId}'`)
+      .select(['id', 'chunkCount', 'corpusKind'])
+      .toArray() as typeof documentRows
+  }
+  const ordered = [...chunkRows].sort((left, right) => left.chunkIndex - right.chunkIndex)
+  const document = documentRows[0]
+  const corpusKind = document?.corpusKind ?? ordered[0]?.corpusKind ?? 'unknown'
+  const canonicalComplete = documentRows.length === 1
+    && ordered.length > 0
+    && document?.chunkCount === ordered.length
+    && new Set(ordered.map(row => row.id)).size === ordered.length
+    && ordered.every((row, index) => (
+      row.chunkIndex === index
+      && row.totalChunks === ordered.length
+      && (row.corpusKind ?? 'unknown') === corpusKind
+      && typeof row.text === 'string'
+    ))
+
+  const registry = readRegistry(projectPath) ?? await inferLegacyRegistry(db, tableNames)
+  const registeredByTable = new Map(registry.spaces.map(space => [space.tableName, space] as const))
+  const physicalEmbeddingTables = new Set(
+    tableNames.filter(tableName => tableName.startsWith(EMBEDDING_TABLE_PREFIX)),
+  )
+  for (const space of registry.spaces) {
+    physicalEmbeddingTables.add(space.tableName)
+  }
+  const canonicalByIndex = new Map(ordered.map(row => [row.chunkIndex, row] as const))
+  const embeddingGenerations: DocumentIntegrity['embeddingGenerations'] = []
+  for (const tableName of [...physicalEmbeddingTables].sort()) {
+    let rows: Array<{
+      id?: unknown
+      chunkIndex?: unknown
+      totalChunks?: unknown
+      text?: unknown
+      vector?: unknown
+      corpusKind?: KnowledgeCorpusKind
+    }> = []
+    if (tableNames.includes(tableName)) {
+      const table = await db.openTable(tableName)
+      await ensureCorpusKindColumn(table)
+      rows = await table.query()
+        .filter(`\`docId\` = '${escapedId}'`)
+        .toArray() as typeof rows
+    }
+    const registered = registeredByTable.get(tableName)
+    const required = rows.length > 0 || registered?.generation === registry.activeGeneration
+    const orderedEmbeddingRows = [...rows].sort((left, right) => (
+      typeof left.chunkIndex === 'number' && typeof right.chunkIndex === 'number'
+        ? left.chunkIndex - right.chunkIndex
+        : 0
+    ))
+    const indexes = orderedEmbeddingRows.map(row => row.chunkIndex)
+    const exactSequence = canonicalComplete
+      && !!registered
+      && orderedEmbeddingRows.length === ordered.length
+      && new Set(indexes).size === orderedEmbeddingRows.length
+      && orderedEmbeddingRows.every((row, index) => {
+        const canonical = canonicalByIndex.get(index)
+        return row.chunkIndex === index
+          && row.totalChunks === ordered.length
+          && row.id === canonical?.id
+          && row.text === canonical?.text
+          && (row.corpusKind ?? 'unknown') === corpusKind
+          && vectorIsUsable(row.vector, registered.vectorDimension)
+      })
+    embeddingGenerations.push({
+      generation: registered?.generation ?? null,
+      tableName,
+      status: registered?.status ?? 'unregistered',
+      chunkCount: rows.length,
+      complete: !required || (!!registered && exactSequence),
+    })
+  }
+  if (
+    documentRows.length === 0
+    && chunkRows.length === 0
+    && embeddingGenerations.every(generation => generation.chunkCount === 0)
+  ) return null
+  return {
+    docId,
+    corpusKind,
+    chunkCount: ordered.length,
+    chunkSetHash: hashCanonicalChunkSet(ordered.map(row => row.text)),
+    // A building generation is intentionally allowed to contain a bounded
+    // prefix while backfill is running.  Active/inactive registry entries are
+    // durable completion markers; unregistered rows are crash residue.
+    complete: canonicalComplete && embeddingGenerations.every(generation => (
+      generation.status === 'building' || generation.complete
+    )),
+    embeddingGenerations,
+  }
+}
+
+export async function getStats(projectPath: string): Promise<KBStats> {
+  return withKnowledgeSourceGate(getProjectDataRoot(projectPath), () => getStatsInternal(projectPath))
+}
+
+async function getStatsInternal(projectPath: string): Promise<KBStats> {
+  try {
+    const db = await getConnection(projectPath)
+    const tableNames = await db.tableNames()
+    if (!tableNames.includes(TABLE_NAME)) {
+      return { documentCount: 0, totalChunks: 0, vectorDimension: 0, hasVectors: false }
+    }
+    const docs = tableNames.includes(DOCS_TABLE_NAME)
+      ? await (await db.openTable(DOCS_TABLE_NAME)).countRows()
+      : 0
+    const registry = await loadOrRegisterLegacyRegistry(projectPath, db, tableNames)
+    const active = activeSpace(registry)
+    return {
+      documentCount: docs,
+      totalChunks: await (await db.openTable(TABLE_NAME)).countRows(),
+      vectorDimension: active?.vectorDimension ?? 0,
+      hasVectors: active !== undefined,
+    }
+  } catch {
+    return { documentCount: 0, totalChunks: 0, vectorDimension: 0, hasVectors: false }
+  }
+}
+
+function backfillSpaceForIdentity(registry: EmbeddingSpaceRegistry, identity?: EmbeddingSpaceIdentity): EmbeddingSpace | undefined {
+  if (!identity) return activeSpace(registry) ?? registry.spaces.find(space => space.status === 'building')
+  const requested = normalizedIdentity(identity)
+  return registry.spaces.find(space => (
+    space.modelFingerprint === requested.modelFingerprint
+    && space.distanceMetric === requested.distanceMetric
+    && (space.status === 'active' || space.status === 'building')
+  ))
+}
+
+async function vectorisedIdsForSpace(db: lancedb.Connection, space: EmbeddingSpace | undefined): Promise<Set<string>> {
+  if (!space) return new Set()
+  const rows = await (await db.openTable(space.tableName)).query().select(['id', 'vector']).toArray()
+  return new Set(
+    rows
+      .filter(row => vectorIsUsable((row as { vector?: unknown }).vector, space.vectorDimension))
+      .map(row => (row as { id: string }).id),
+  )
+}
+
+async function missingCanonicalRows(
+  db: lancedb.Connection,
+  space: EmbeddingSpace | undefined,
+): Promise<Array<{ id: string; text: string }>> {
+  const rows = await (await db.openTable(TABLE_NAME)).query().select(['id', 'text']).toArray()
+  const vectorisedIds = await vectorisedIdsForSpace(db, space)
+  return rows
+    .map(row => ({ id: (row as { id: string }).id, text: (row as { text: string }).text }))
+    .filter(row => !vectorisedIds.has(row.id))
+}
+
+export async function getChunksWithoutVectors(
+  projectPath: string,
+  embeddingSpace?: EmbeddingSpaceIdentity,
+): Promise<{ count: number }> {
+  return withKnowledgeSourceGate(getProjectDataRoot(projectPath), () => getChunksWithoutVectorsInternal(projectPath, embeddingSpace))
+}
+
+async function getChunksWithoutVectorsInternal(
+  projectPath: string,
+  embeddingSpace?: EmbeddingSpaceIdentity,
+): Promise<{ count: number }> {
+  const db = await getConnection(projectPath)
+  const tableNames = await db.tableNames()
+  if (!tableNames.includes(TABLE_NAME)) return { count: 0 }
+  const registry = await loadOrRegisterLegacyRegistry(projectPath, db, tableNames)
+  return { count: (await missingCanonicalRows(db, backfillSpaceForIdentity(registry, embeddingSpace))).length }
+}
+
+/** 返回当前模型需要回填的文本块；不在此处创建或删除表。 */
+export async function getChunksForBackfill(
+  projectPath: string,
+  batchSize: number = 50,
+  embeddingSpace?: EmbeddingSpaceIdentity,
+): Promise<Array<{ id: string; text: string }>> {
+  const db = await getConnection(projectPath)
+  const tableNames = await db.tableNames()
+  if (!tableNames.includes(TABLE_NAME)) return []
+  // Migration preflight must not create an embedding registry. If validation
+  // rejects this legacy source, the project needs to remain byte-for-byte as
+  // it was before the attempt.
+  const registry = readRegistry(projectPath) ?? await inferLegacyRegistry(db, tableNames)
+  return (await missingCanonicalRows(db, backfillSpaceForIdentity(registry, embeddingSpace))).slice(0, batchSize)
+}
+
+/**
+ * 为已存在的 canonical 文本块添加向量。实际维度由更新批次决定；不覆写或
+ * drop 旧表，且只有完整覆盖 canonical 表后才可能切换 active。
+ */
+export async function updateChunkVectors(
+  projectPath: string,
+  updates: Array<{ id: string; vector: number[] }>,
+  embeddingSpace?: EmbeddingSpaceIdentity,
+): Promise<{ success: boolean; count: number; error?: string }> {
+  return withKnowledgeSourceGate(getProjectDataRoot(projectPath), () => updateChunkVectorsInternal(projectPath, updates, embeddingSpace))
+}
+
+async function updateChunkVectorsInternal(
+  projectPath: string,
+  updates: Array<{ id: string; vector: number[] }>,
+  embeddingSpace?: EmbeddingSpaceIdentity,
+): Promise<{ success: boolean; count: number; error?: string }> {
+  const validation = validateVectorsForChunks(updates.map(update => update.id), updates.map(update => update.vector))
+  if (validation.error || !validation.vectors || validation.dimension === undefined) {
+    return { success: false, count: 0, error: validation.error ?? 'EMBEDDING_RESPONSE_INVALID' }
+  }
+  if (new Set(updates.map(update => update.id)).size !== updates.length) {
+    return { success: false, count: 0, error: 'EMBEDDING_SPACE_BACKFILL_DUPLICATE_ID' }
+  }
+
+  let db: lancedb.Connection | undefined
+  let write: EmbeddingWrite | undefined
+  try {
+    db = await getConnection(projectPath)
+    const tableNames = await db.tableNames()
+    if (!tableNames.includes(TABLE_NAME)) return { success: false, count: 0, error: 'EMBEDDING_SPACE_BACKFILL_TARGET_MISSING' }
+    const canonicalRows = await (await db.openTable(TABLE_NAME)).query().toArray()
+    const updateById = new Map(updates.map(update => [update.id, update.vector]))
+    const records = canonicalRows
+      .filter(row => updateById.has((row as { id: string }).id))
+      .map((row) => ({
+        ...(row as Record<string, unknown>),
+        vector: updateById.get((row as { id: string }).id)!,
+      })) as ChunkRecord[]
+    if (records.length !== updates.length) {
+      return { success: false, count: 0, error: 'EMBEDDING_SPACE_BACKFILL_TARGET_MISSING' }
+    }
+
+    const registry = await loadOrRegisterLegacyRegistry(projectPath, db, tableNames)
+    write = await appendEmbeddingRecords(
+      projectPath,
+      db,
+      registry,
+      records,
+      validation.dimension,
+      normalizedIdentity(embeddingSpace, validation.dimension),
+    )
+    await finaliseEmbeddingWrite(projectPath, db, registry, write)
+    return { success: true, count: updates.length }
+  } catch (error) {
+    if (db && write) {
+      await compensateEmbeddingWrite(db, write, updates.map(update => update.id))
+    }
+    console.error('[AI Novel VectorStore] 批量更新向量失败:', error)
+    return { success: false, count: 0, error: error instanceof Error ? error.message : String(error) }
+  }
+}

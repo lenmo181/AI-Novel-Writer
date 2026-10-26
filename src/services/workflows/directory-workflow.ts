@@ -1,0 +1,418 @@
+import type { DirectoryGenerationProgress } from '../../shared/generation-owner-contract'
+import { DEFAULT_PLANNING_TARGET_UNITS } from '../../shared/plot-outline-contract'
+import type { MainGenerationRunHandle } from '../generation/generation-runtime'
+import { workflowResourceKey, type WorkflowDefinition } from '../../stores/workflow-store'
+import { useProjectStore } from '../../stores/project-store'
+import { useLocaleStore } from '../../stores/locale-store'
+import type { Locale } from '../../i18n/types'
+import { localize } from '../../i18n/core'
+import type { ProjectSessionContext } from '../../shared/ipc-channels'
+import { globalEventBus } from '../../shared/event-bus'
+import {
+  decodeBlueprintSemanticPayload,
+  parseBlueprintSemanticResponseText,
+  parseBlueprintAuthorResponseText,
+  type BlueprintSemanticItem,
+} from '../../shared/blueprint-semantic-contract'
+import { structuredContractDiagnostic } from '../../shared/structured-contract-diagnostic'
+import {
+  projectSessionContextFromProject,
+  sameProjectPathKey,
+  sameProjectSessionContext,
+} from '../../shared/project-session-context'
+import { ipc } from '../ipc-client'
+import { PromptBudgetExceededError } from '../generation/generation-harness'
+import type {
+  BlueprintData,
+  BlueprintRangeCommitMode,
+  BlueprintRangeCommitReceipt,
+} from '../../../electron/repositories/blueprint-repository'
+import { stripThinkingTags } from './workflow-utils'
+import { requireWorkflowProjectSession, workflowMainProcessError } from './workflow-project-session'
+import { displayedErrorMessage } from '../../i18n/app-errors'
+
+// ==========================================
+// 1. 结构与类型导出 (保留对外的向后兼容)
+// ==========================================
+
+export type ChapterBlueprint = BlueprintData
+
+export interface DirectoryWorkflowParams {
+  restartFrom?: MainGenerationRunHandle
+  targetUnits?: number
+  /** Exact committed progress selected by the author; no inferred latest run. */
+  continueDirectoryOperationId?: string
+  mode: 'full' | 'append'
+  startChapter?: number
+  count?: number
+  /** 节奏/风格指导（可选） */
+  pacingGuidance?: string
+}
+
+/** Follow only the explicit run chain, including a run re-admitted under a new epoch. */
+export function terminalDirectoryProgress(progress: DirectoryGenerationProgress, all: readonly DirectoryGenerationProgress[]): DirectoryGenerationProgress {
+  const visited = new Set<string>()
+  let current = progress
+  for (;;) {
+    if (visited.has(current.operationId)) throw new Error('DIRECTORY_PROGRESS_CYCLE')
+    visited.add(current.operationId)
+    const handle = current.continuationHandle
+    if (!handle) return current
+    const children = all.filter(item => item.sourceHandle.projectId === handle.projectId
+      && item.sourceHandle.rootActionId === handle.rootActionId && item.sourceHandle.runId === handle.runId)
+    if (children.length > 1) throw new Error('DIRECTORY_PROGRESS_AMBIGUOUS')
+    if (!children.length) return current
+    current = children[0]
+  }
+}
+
+export async function resolveDirectoryContinuation(params: DirectoryWorkflowParams, session: ProjectSessionContext, uiLocale: Locale): Promise<DirectoryWorkflowParams & { resumeHandle?: MainGenerationRunHandle; authorConfig?: DirectoryWorkflowProjectSnapshot['novelConfig'] }> {
+  if (!params.continueDirectoryOperationId) return params
+  const { progress: all } = await ipc.invokeWithProjectSession(session, 'generation:list-directory-progress')
+  const selected = all.find(item => item.operationId === params.continueDirectoryOperationId)
+  if (!selected || selected.sourceHandle.projectId !== session.projectId) throw new Error('DIRECTORY_PROGRESS_NOT_FOUND')
+  const terminal = terminalDirectoryProgress(selected, all)
+  if (!terminal.remainingRange) throw new Error('DIRECTORY_PROGRESS_COMPLETE')
+  const pacing = terminal.authorInputs?.find(item => item.id === 'directory:pacing-guidance')
+  const config = terminal.authorInputs?.find(item => item.id === 'directory:author-config')
+  if (!pacing || !config) {
+    throw new Error(localize(
+      uiLocale,
+      '旧目录进度缺少冻结作者输入，不能自动继续；已保存蓝图保持不变。',
+      'This older blueprint progress has no frozen author input, so it cannot continue automatically. The saved blueprints are unchanged.',
+    ))
+  }
+  const authorConfig: DirectoryWorkflowProjectSnapshot['novelConfig'] = JSON.parse(config.text)
+  if (!authorConfig || !Number.isSafeInteger(authorConfig.totalChapters) || authorConfig.totalChapters < terminal.remainingRange.endChapter) throw new Error('DIRECTORY_FROZEN_CONFIG_INVALID')
+  return { ...params, targetUnits: Number(terminal.authorInputs?.find(item => item.id === 'planning:target-units')?.text ?? DEFAULT_PLANNING_TARGET_UNITS), pacingGuidance: pacing.text, authorConfig, mode: 'append', startChapter: terminal.remainingRange.startChapter,
+    count: terminal.remainingRange.endChapter - terminal.remainingRange.startChapter + 1,
+    continueDirectoryOperationId: terminal.continuationHandle ? undefined : terminal.operationId,
+    ...(terminal.continuationHandle ? { resumeHandle: terminal.continuationHandle } : {}) }
+}
+
+export interface DirectoryWorkflowProjectSnapshot {
+  expectedProjectPath: string
+  novelConfig: Readonly<{
+    totalChapters: number
+    wordsPerChapter?: number
+    globalGuidance?: string
+    genre?: string
+  }>
+}
+
+// ==========================================
+// 2. 蓝图文件访问与工具函数
+// ==========================================
+
+function extractJsonPayload(content: string): string | null {
+  const cleanContent = stripThinkingTags(content)
+  const jsonStr = cleanContent.replace(/```json?\n?/gi, '').replace(/```\n?/g, '').trim()
+  const firstBrace = jsonStr.indexOf('{')
+  const firstBracket = jsonStr.indexOf('[')
+  const lastBrace = jsonStr.lastIndexOf('}')
+  const lastBracket = jsonStr.lastIndexOf(']')
+  if (firstBrace === -1 && firstBracket === -1) return null
+  if (firstBracket !== -1 && (firstBrace === -1 || firstBracket < firstBrace)) {
+    return lastBracket === -1 ? null : jsonStr.substring(firstBracket, lastBracket + 1)
+  }
+  return lastBrace === -1 ? null : jsonStr.substring(firstBrace, lastBrace + 1)
+}
+
+function persistedBlueprint(item: BlueprintSemanticItem): ChapterBlueprint {
+  return {
+    ...item,
+    userGuidance: '',
+    notes: '',
+    notesUpdatedAt: '',
+  }
+}
+
+function chapterRange(startNum: number, endNum: number): number[] {
+  return Array.from({ length: endNum - startNum + 1 }, (_, index) => startNum + index)
+}
+
+export function parseTextBlueprints(content: string, startNum: number, endNum: number): ChapterBlueprint[] {
+  try {
+    const payload = extractJsonPayload(content)
+    if (!payload) return []
+    const parsed: unknown = JSON.parse(payload)
+    const candidates = parsed && typeof parsed === 'object' && !Array.isArray(parsed) && 'blueprints' in parsed
+      ? (parsed as { blueprints: unknown }).blueprints
+      : parsed
+    if (!Array.isArray(candidates)) return []
+    const expected = candidates.flatMap((candidate) => {
+      if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return []
+      const raw = candidate as Record<string, unknown>
+      const chapter = Number(raw.chapterNumber ?? raw.chapter_number)
+      return Number.isSafeInteger(chapter) && chapter >= startNum && chapter <= endNum ? [chapter] : []
+    })
+    if (expected.length === 0 || new Set(expected).size !== expected.length) return []
+    const filtered = candidates.filter((candidate) => {
+      if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return false
+      const raw = candidate as Record<string, unknown>
+      return expected.includes(Number(raw.chapterNumber ?? raw.chapter_number))
+    })
+    return decodeBlueprintSemanticPayload(filtered, expected).map(persistedBlueprint)
+  } catch {
+    console.error('Failed to parse blueprint JSON', content)
+  }
+
+  return []
+}
+
+export function parseTextBlueprintsStrict(
+  content: string,
+  startNum: number,
+  endNum: number,
+  uiLocale: Locale,
+  source: 'model' | 'author' = 'model',
+): ChapterBlueprint[] {
+  try {
+    if (source === 'author') return parseBlueprintAuthorResponseText(content, chapterRange(startNum, endNum))
+    return parseBlueprintSemanticResponseText(
+      stripThinkingTags(content),
+      chapterRange(startNum, endNum),
+    ).map(persistedBlueprint)
+  } catch (error) {
+    if (structuredContractDiagnostic(error)) throw error
+    const detail = displayedErrorMessage(uiLocale, error)
+    throw new Error(localize(uiLocale, `蓝图 JSON 解析失败：${detail}`, `Could not parse the blueprint JSON: ${detail}`))
+  }
+}
+
+export async function loadDirectoryBlueprints(
+  expectedProjectPath: string,
+  projectSession: ProjectSessionContext,
+): Promise<ChapterBlueprint[]> {
+  const blueprints = await ipc.invokeWithProjectSession(projectSession, 'db:blueprint-get-all', expectedProjectPath)
+  return blueprints.sort((a, b) => a.chapterNumber - b.chapterNumber)
+}
+
+export async function saveChapterBlueprint(
+  blueprint: ChapterBlueprint,
+  expectedProjectPath: string,
+  projectSession: ProjectSessionContext,
+  uiLocale: Locale,
+): Promise<void> {
+  const result = await ipc.invokeWithProjectSession(projectSession, 'db:blueprint-upsert', blueprint, expectedProjectPath)
+  if (!result.success) {
+    throw workflowMainProcessError({ uiLocale }, result.error, '保存章节蓝图失败', 'Could not save the chapter blueprint.')
+  }
+}
+
+export async function saveAllBlueprints(
+  blueprints: ChapterBlueprint[],
+  expectedProjectPath: string,
+  projectSession: ProjectSessionContext,
+  uiLocale: Locale,
+): Promise<void> {
+  const result = await ipc.invokeWithProjectSession(projectSession, 'db:blueprint-upsert-many', blueprints, expectedProjectPath)
+  if (!result.success) {
+    throw workflowMainProcessError({ uiLocale }, result.error, '保存章节蓝图失败', 'Could not save the chapter blueprints.')
+  }
+}
+
+export async function commitDirectoryBlueprintRange(
+  blueprints: ChapterBlueprint[],
+  expectedProjectPath: string,
+  range: { mode: BlueprintRangeCommitMode; startChapter: number; endChapter: number },
+  operationId: string,
+  projectSession: ProjectSessionContext,
+  uiLocale: Locale,
+  generationRunHandle?: MainGenerationRunHandle,
+  generationRequestedRange?: { startChapter: number; endChapter: number },
+): Promise<BlueprintRangeCommitReceipt> {
+  const result = await ipc.invokeWithProjectSession(
+    projectSession,
+    'db:blueprint-commit-range',
+    {
+      mode: range.mode,
+      operationId,
+      startChapter: range.startChapter,
+      endChapter: range.endChapter,
+      blueprints,
+      ...(generationRunHandle ? { generationRunHandle, generationRequestedRange } : {}),
+    },
+    expectedProjectPath,
+  )
+  if (!result.success || !result.receipt) {
+    throw workflowMainProcessError({ uiLocale }, result.error, '提交章节蓝图失败', 'Could not commit the chapter blueprints.')
+  }
+  globalEventBus.emit('REFRESH_RESOURCE', {
+    resources: ['blueprints'],
+    projectPath: expectedProjectPath,
+    projectSession,
+  })
+  return result.receipt
+}
+
+export async function getBlueprintCount(
+  expectedProjectPath: string,
+  projectSession: ProjectSessionContext,
+): Promise<number> {
+  try {
+    const blueprints = await ipc.invokeWithProjectSession(projectSession, 'db:blueprint-get-all', expectedProjectPath)
+    return blueprints.length
+  } catch {
+    return 0
+  }
+}
+
+// ==========================================
+// 3. 工作流定义映射工厂 (Command 调度层)
+// ==========================================
+
+export function createDirectoryWorkflow(
+  params: DirectoryWorkflowParams,
+  expectedProjectPath: string,
+  sourceProjectSession: ProjectSessionContext,
+  frozenUiLocale: Locale = useLocaleStore.getState().locale,
+): WorkflowDefinition {
+  const text = (zhCNText: string, enUSText: string) => frozenUiLocale === 'en-US' ? enUSText : zhCNText
+  const projectAtStart = useProjectStore.getState().currentProject
+  const currentProjectSession = projectSessionContextFromProject(projectAtStart)
+  if (
+    !projectAtStart
+    || !currentProjectSession
+    || !sameProjectPathKey(projectAtStart.path, expectedProjectPath)
+    || !sameProjectSessionContext(sourceProjectSession, currentProjectSession)
+  ) {
+    throw new Error(text(
+      '项目已切换，无法启动章节蓝图生成',
+      'The project changed, so chapter-blueprint generation could not start.',
+    ))
+  }
+  const projectSession = Object.freeze({ ...sourceProjectSession })
+  const projectSnapshot: DirectoryWorkflowProjectSnapshot = {
+    expectedProjectPath,
+    novelConfig: {
+      totalChapters: projectAtStart.novelConfig.totalChapters,
+      wordsPerChapter: projectAtStart.novelConfig.wordsPerChapter,
+      globalGuidance: projectAtStart.novelConfig.globalGuidance,
+      genre: projectAtStart.novelConfig.genre,
+    },
+  }
+
+  return {
+    type: 'directory',
+    uiLocale: frozenUiLocale,
+    title: params.mode === 'append'
+      ? text(
+        `续写章节蓝图${params.startChapter ? `（从第 ${params.startChapter} 章）` : ''}`,
+        `Continue chapter blueprints${params.startChapter ? ` (from chapter ${params.startChapter})` : ''}`,
+      )
+      : text('生成章节蓝图（全量）', 'Generate chapter blueprints (all)'),
+    projectPath: expectedProjectPath,
+    projectSession,
+    resourceKeys: [
+      workflowResourceKey('blueprints'),
+      workflowResourceKey('character-roster'),
+    ],
+    readResourceKeys: [
+      workflowResourceKey('novel-config'),
+      workflowResourceKey('architecture'),
+    ],
+    steps: [
+      {
+        name: text('读取架构', 'Read architecture'),
+        description: text('从 SQLite 加载项目架构信息', 'Load the project architecture from SQLite'),
+        executor: async (_step, context, callbacks) => {
+          callbacks.log(text('读取项目架构信息...', 'Loading project architecture...'))
+          const projectSession = requireWorkflowProjectSession(context)
+          const core = await ipc.invokeWithProjectSession(
+            projectSession,
+            'db:project-core-get',
+            expectedProjectPath,
+          )
+          if (!core) throw new Error(text(
+            '项目核心数据未初始化',
+            'Project core data has not been initialized.',
+          ))
+
+          const parts: string[] = []
+          if (core.premise && core.premise.length > 50) parts.push(core.premise)
+          if (core.charactersArch && core.charactersArch.length > 50) parts.push(core.charactersArch)
+          if (core.worldbuilding && core.worldbuilding.length > 50) parts.push(core.worldbuilding)
+          if (core.synopsis && core.synopsis.length > 50) parts.push(core.synopsis)
+
+          if (parts.length === 0) throw new Error(text(
+            '项目主要架构均未生成',
+            'The main story architecture has not been generated yet.',
+          ))
+
+          context.data.architecture = parts.join('\n\n---\n\n')
+          // 注入节奏指导到 context，供 Command 读取
+          if (params.pacingGuidance) context.data.pacingGuidance = params.pacingGuidance
+          if (params.mode === 'append' || params.continueDirectoryOperationId) {
+            const existing = await loadDirectoryBlueprints(expectedProjectPath, projectSession)
+            context.data.existingBlueprints = existing
+            callbacks.log(text(
+              `已加载 ${existing.length} 章已有蓝图`,
+              `Loaded ${existing.length} existing chapter blueprint${existing.length === 1 ? '' : 's'}`,
+            ))
+          }
+          return text(
+            `架构加载完成（${parts.length} 段）`,
+            `Architecture loaded (${parts.length} section${parts.length === 1 ? '' : 's'})`,
+          )
+        },
+      },
+      {
+        name: text('生成蓝图', 'Generate blueprints'),
+        description: text(
+          '基于架构文件生成、完整验证并原子提交章节蓝图',
+          'Generate, fully validate, and atomically commit chapter blueprints from the architecture',
+        ),
+        executor: async (_step, context, callbacks) => {
+          const directoryCommand = await import('./commands/directory.command')
+          const resolvedParams = await resolveDirectoryContinuation(params, projectSession, frozenUiLocale)
+          context.data.directoryResumeHandle = resolvedParams.resumeHandle
+          if (params.continueDirectoryOperationId) context.data.pacingGuidance = resolvedParams.pacingGuidance
+          const cmd = new directoryCommand.GenerateDirectoryCommand(resolvedParams, resolvedParams.authorConfig ? { ...projectSnapshot, novelConfig: resolvedParams.authorConfig } : projectSnapshot)
+          let blueprints: ChapterBlueprint[]
+          try {
+            blueprints = await cmd.execute({ step: _step, context, callbacks })
+          } catch (error) {
+            if (error instanceof PromptBudgetExceededError || error instanceof directoryCommand.DirectoryPartialCommitError) throw error
+            if (error instanceof directoryCommand.DirectoryPostCommitSyncError) {
+              throw new Error(text(
+                '章节蓝图已保存，但角色同步失败。请重试角色同步。',
+                'Chapter blueprints were saved, but character synchronization failed. Retry character synchronization.',
+              ))
+            }
+            if (error instanceof directoryCommand.DirectoryPostCommitCancellationError) {
+              throw new Error(text(
+                '章节蓝图已保存，但任务取消后角色同步可能未完成。',
+                'Chapter blueprints were saved, but character synchronization may be incomplete because the workflow was cancelled.',
+              ))
+            }
+            if (error instanceof directoryCommand.DirectoryCostLimitError) {
+              throw new Error(text(
+                '本次章节范围过大，请拆分为更小的范围生成。',
+                'The requested chapter range is too large. Generate a smaller range.',
+              ))
+            }
+            if (context.cancelled) {
+              throw new Error(text('工作流已取消', 'Workflow was cancelled.'))
+            }
+            throw new Error(text(
+              '章节蓝图生成失败，请重试。',
+              'Chapter-blueprint generation failed. Please try again.',
+            ))
+          }
+          // 返回可读摘要字符串（step.result 必须是 string，否则 AIOutputPanel 渲染会崩溃）
+          return text(
+            `已生成 ${blueprints.length} 章蓝图`,
+            `Generated ${blueprints.length} chapter blueprint${blueprints.length === 1 ? '' : 's'}`,
+          )
+        },
+      },
+    ],
+    onComplete: {
+      mode: 'silent',
+      message: params.mode === 'append'
+        ? text('续写蓝图生成完成', 'Chapter blueprint continuation completed')
+        : text('本次章节蓝图已生成完成。', 'The requested chapter blueprints have been generated.'),
+    },
+  }
+}

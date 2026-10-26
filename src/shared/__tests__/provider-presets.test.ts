@@ -1,0 +1,310 @@
+import { describe, expect, it } from 'vitest'
+
+import {
+  createProviderCatalog,
+  isLocalModelEndpoint,
+  resolveModelProfileBudgetCapabilities,
+  resolveModelProfileCapabilities,
+  resolveModelProfileReasoningMapping,
+} from '../provider-presets'
+
+describe('provider catalog', () => {
+  it('admits only documented GLM 5.3 capacity and reasoning on the official endpoint', () => {
+    const profile = { provider: 'bigmodel', protocol: 'openai',
+      baseUrl: 'https://open.bigmodel.cn/api/paas/v4', modelName: 'glm-5.3' }
+    expect(resolveModelProfileBudgetCapabilities(profile)).toEqual({ contextWindowTokens: 1_000_000, maxOutputTokens: 131_072,
+      evidence: { sourceUrl: 'https://docs.bigmodel.cn/cn/guide/models/text/glm-5.3', calibration: 'conservative-provider-documentation' } })
+    expect(resolveModelProfileReasoningMapping(profile)).toEqual({ adapter: 'openai-reasoning-effort',
+      supportedEfforts: ['low', 'high', 'max'], providerValues: { low: 'low', high: 'high', max: 'max' } })
+    const preset = createProviderCatalog().find(item => item.provider === 'bigmodel')?.models.find(item => item.name === 'glm-5.3')
+    expect(preset?.structuredOutput).toBe(true)
+    expect(preset?.capabilities).toBeUndefined()
+    for (const overrides of [{ baseUrl: 'https://proxy.example/v4' },
+      { baseUrl: 'https://open.bigmodel.cn/api/paas/v4?proxy=1' }, { modelName: 'glm-5.3-flash' },
+      { modelName: 'glm-5.3-other' }, { protocol: 'gemini' }]) {
+      expect(resolveModelProfileBudgetCapabilities({ ...profile, ...overrides })).toBeUndefined()
+      expect(resolveModelProfileReasoningMapping({ ...profile, ...overrides })).toBeUndefined()
+    }
+  })
+
+  it('keeps scoped Qwen capacity on the exact CN endpoint and model', () => {
+    const profile = { provider: 'siliconflow', protocol: 'openai',
+      baseUrl: 'https://api.siliconflow.cn/v1', modelName: 'Qwen/Qwen3.8-27B' }
+    expect(resolveModelProfileBudgetCapabilities(profile)).toMatchObject({ contextWindowTokens: 262144, maxOutputTokens: 16384 })
+    expect(resolveModelProfileBudgetCapabilities({ ...profile, provider: 'custom' }))
+      .toEqual(resolveModelProfileBudgetCapabilities(profile))
+    for (const overrides of [{ baseUrl: 'https://api.siliconflow.com/v1' },
+      { baseUrl: 'https://api.siliconflow.cn/v1?proxy=1' }, { modelName: 'Qwen/Qwen3.8-27B-other' },
+      { protocol: 'gemini' }]) {
+      expect(resolveModelProfileBudgetCapabilities({ ...profile, ...overrides })).toBeUndefined()
+      expect(resolveModelProfileReasoningMapping({ ...profile, ...overrides })).toBeUndefined()
+    }
+  })
+
+  it('exposes xAI Grok through its documented OpenAI-compatible preset', () => {
+    const xai = createProviderCatalog().find((preset) => preset.provider === 'xai')
+
+    expect(xai).toMatchObject({
+      provider: 'xai',
+      displayName: 'xAI(Grok)',
+      baseUrl: 'https://api.x.ai/v1',
+      protocol: 'openai',
+    })
+    expect(xai?.models).toContainEqual(expect.objectContaining({
+      name: 'grok-4.5',
+      maxTokens: 8192,
+      capabilities: {
+        contextWindowTokens: 500_000,
+        maxOutputTokens: 8192,
+        reasoning: true,
+        structuredOutput: true,
+        usage: true,
+      },
+      reasoningMapping: {
+        adapter: 'openai-reasoning-effort',
+        supportedEfforts: ['low', 'medium', 'high'],
+        providerValues: { low: 'low', medium: 'medium', high: 'high' },
+      },
+    }))
+  })
+
+  it.each(['https://api.deepseek.com', 'https://api.deepseek.com/', 'https://api.deepseek.com/v1', 'https://api.deepseek.com/v1/'])(
+    'resolves official DeepSeek facts for %s', (baseUrl) => {
+    const legacy = {
+      provider: 'deepseek',
+      protocol: 'openai',
+      baseUrl,
+      modelName: 'deepseek-v4-flash',
+      maxTokens: 100_000,
+      capabilities: null,
+    }
+
+    expect(resolveModelProfileCapabilities(legacy)).toEqual({
+      contextWindowTokens: 1_000_000,
+      maxOutputTokens: 384_000,
+      reasoning: true,
+      structuredOutput: true,
+      usage: true,
+    })
+
+    expect(resolveModelProfileCapabilities({
+      ...legacy,
+      baseUrl: 'https://proxy.example.com/v1',
+    })).toBeUndefined()
+
+    expect(resolveModelProfileCapabilities({
+      ...legacy,
+      protocol: 'gemini',
+    })).toBeUndefined()
+
+    expect(resolveModelProfileCapabilities({
+      ...legacy,
+      baseUrl: 'https://api.deepseek.com?tenant=other',
+    })).toBeUndefined()
+
+    const explicit = {
+      contextWindowTokens: 32_768,
+      maxOutputTokens: 2048,
+      reasoning: true,
+      structuredOutput: false,
+      usage: false,
+    }
+    expect(resolveModelProfileCapabilities({ ...legacy, capabilities: explicit })).toEqual({
+      contextWindowTokens: 1_000_000,
+      maxOutputTokens: 384_000,
+      reasoning: true,
+      structuredOutput: true,
+      usage: true,
+    })
+
+    expect(resolveModelProfileReasoningMapping(legacy)).toEqual({
+      adapter: 'deepseek-v4-thinking',
+      supportedEfforts: ['off', 'low', 'high', 'max'],
+      providerValues: { off: 'disabled', low: 'low', high: 'high', max: 'max' },
+      requestAliases: { medium: 'high' },
+    })
+    expect(resolveModelProfileBudgetCapabilities(legacy)).toEqual({ contextWindowTokens: 1_000_000, maxOutputTokens: 384_000 })
+  })
+
+  it('does not grant DeepSeek facts to other endpoints, protocols or models', () => {
+    const profile = { provider: 'deepseek', protocol: 'openai', baseUrl: 'https://api.deepseek.com/v1', modelName: 'deepseek-v4-flash' }
+    for (const overrides of [
+      ...['https://proxy.example/v1', 'https://api.deepseek.com/proxy/v1', 'https://api.deepseek.com/v2',
+        'http://api.deepseek.com/v1', 'https://api.deepseek.com:8443/v1', 'https://api.deepseek.com/v1?tenant=other',
+        'https://api.deepseek.com/v1#other', 'https://user:password@api.deepseek.com/v1'].map(baseUrl => ({ baseUrl })),
+      { protocol: 'gemini' }, { modelName: 'deepseek-v4-flash-other' },
+    ]) {
+      expect(resolveModelProfileCapabilities({ ...profile, ...overrides })).toBeUndefined()
+      expect(resolveModelProfileBudgetCapabilities({ ...profile, ...overrides })).toBeUndefined()
+      expect(resolveModelProfileReasoningMapping({ ...profile, ...overrides })).toBeUndefined()
+    }
+  })
+
+  it('publishes the Gemini 3 presets with documented capacity and thinking levels, defaulting to Gemini 3.8 Flash', () => {
+    const gemini = createProviderCatalog().find((preset) => preset.provider === 'gemini')
+    expect(gemini).toMatchObject({ baseUrl: 'https://generativelanguage.googleapis.com', protocol: 'gemini' })
+    expect(gemini?.models.map(model => model.name))
+      .toEqual(['gemini-3.8-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-pro-preview', 'gemini-3-flash-preview'])
+    expect(gemini?.embeddingModels).toEqual(['gemini-embedding-001'])
+
+    // 思考等级取自 https://ai.google.dev/gemini-api/docs/generate-content/thinking 。
+    const levels = { low: 'low', medium: 'medium', high: 'high' }
+    const expected = {
+      'gemini-3.8-flash': { supportedEfforts: ['low', 'medium', 'high'], providerValues: levels },
+      'gemini-3.5-flash-lite': { supportedEfforts: ['off', 'low', 'medium', 'high'], providerValues: { off: 'minimal', ...levels } },
+      'gemini-3.1-pro-preview': { supportedEfforts: ['low', 'medium', 'high'], providerValues: levels },
+      'gemini-3-flash-preview': { supportedEfforts: ['off', 'low', 'medium', 'high'], providerValues: { off: 'minimal', ...levels } },
+    }
+    for (const [modelName, mapping] of Object.entries(expected)) {
+      const profile = { provider: 'gemini', protocol: 'gemini', baseUrl: 'https://generativelanguage.googleapis.com', modelName }
+      expect(resolveModelProfileCapabilities(profile)).toEqual({
+        contextWindowTokens: 1_048_576, maxOutputTokens: 65_536, reasoning: true, structuredOutput: true, usage: true,
+      })
+      expect(resolveModelProfileReasoningMapping(profile)).toEqual({ adapter: 'gemini-thinking-level', ...mapping })
+    }
+  })
+
+  it('keeps resolving saved Gemini 2.5 Flash-Lite profiles without offering the retired model again', () => {
+    const gemini = createProviderCatalog().find((preset) => preset.provider === 'gemini')
+    expect(gemini?.models.map(model => model.name)).not.toContain('gemini-2.5-flash-lite')
+    const saved = { provider: 'gemini', protocol: 'gemini', baseUrl: 'https://generativelanguage.googleapis.com', modelName: 'gemini-2.5-flash-lite' }
+    expect(resolveModelProfileCapabilities(saved)).toEqual({
+      contextWindowTokens: 1_048_576, maxOutputTokens: 65_536, reasoning: true, structuredOutput: true, usage: true,
+    })
+    expect(resolveModelProfileReasoningMapping(saved)).toEqual({
+      adapter: 'gemini-thinking-budget',
+      supportedEfforts: ['off', 'low', 'medium', 'high'],
+      providerValues: { off: 0, low: 1_024, medium: 8_192, high: 24_576 },
+    })
+  })
+
+  it.each([
+    ['deepseek-ai/DeepSeek-V4-Flash', 'https://www.siliconflow.com/models/deepseek-v4-flash'],
+    ['deepseek-ai/DeepSeek-V4-Pro', 'https://www.siliconflow.com/models/deepseek-v4-pro'],
+  ])('publishes conservative SiliconFlow budget facts and explicit reasoning mapping separately: %s', (modelName, sourceUrl) => {
+    const siliconflow = createProviderCatalog().find((preset) => preset.provider === 'siliconflow')
+
+    expect(siliconflow).toMatchObject({
+      baseUrl: 'https://api.siliconflow.cn/v1',
+      budgetCapabilityBaseUrls: ['https://api.siliconflow.com/v1'],
+      budgetProviderAliases: ['openai'],
+      protocol: 'openai',
+    })
+    expect(siliconflow?.models).toContainEqual({
+      name: modelName,
+      structuredOutput: true,
+      maxTokens: 16_384,
+      reasoningMapping: {
+        adapter: 'siliconflow-v4-thinking',
+        supportedEfforts: ['high', 'max'],
+        providerValues: { high: 'high', max: 'max' },
+      },
+      budgetCapabilities: {
+        contextWindowTokens: 1_000_000,
+        maxOutputTokens: 393_000,
+        evidence: {
+          sourceUrl,
+          calibration: 'conservative-provider-documentation',
+        },
+      },
+    })
+    expect(siliconflow?.models.find(model => model.name === modelName)?.capabilities).toBeUndefined()
+  })
+
+  it.each(['deepseek-ai/DeepSeek-V4-Flash', 'deepseek-ai/DeepSeek-V4-Pro'])(
+    'resolves the approved OpenAI-compatible SiliconFlow profile without changing its provider: %s', modelName => {
+      const profile = { provider: 'openai', protocol: 'openai', baseUrl: 'https://api.siliconflow.cn/v1',
+        modelName, maxTokens: 16_384 }
+      expect(resolveModelProfileBudgetCapabilities(profile)).toMatchObject({
+        contextWindowTokens: 1_000_000,
+        maxOutputTokens: 393_000,
+      })
+      expect(resolveModelProfileReasoningMapping(profile)).toMatchObject({
+        adapter: 'siliconflow-v4-thinking',
+        supportedEfforts: ['high', 'max'],
+        providerValues: { high: 'high', max: 'max' },
+      })
+    })
+
+  it.each([
+    { baseUrl: 'https://api.siliconflow.com/v1' },
+    { baseUrl: 'http://api.siliconflow.cn/v1' },
+    { baseUrl: 'https://api.siliconflow.cn/v2' },
+    { baseUrl: 'https://api.siliconflow.cn/v1/chat/completions' },
+    { baseUrl: 'https://api.siliconflow.cn.evil.test/v1' },
+    { baseUrl: 'https://api.siliconflow.cn:8443/v1' },
+    { baseUrl: 'https://user@api.siliconflow.cn/v1' },
+    { baseUrl: 'https://api.siliconflow.cn/v1?route=other' },
+    { baseUrl: 'https://api.siliconflow.cn/v1#other' },
+    { modelName: 'deepseek-ai/DeepSeek-V4-Pro-2026' },
+    { modelName: 'deepseek-ai/DeepSeek-V4-Flash-2026' },
+    { protocol: 'anthropic' },
+  ])('does not promote SiliconFlow budget or family matches into reasoning evidence: %j', overrides => {
+    expect(resolveModelProfileReasoningMapping({ provider: 'openai', protocol: 'openai',
+      baseUrl: 'https://api.siliconflow.cn/v1', modelName: 'deepseek-ai/DeepSeek-V4-Flash', ...overrides })).toBeUndefined()
+  })
+
+  it.each(['deepseek-ai/DeepSeek-V4-Flash', 'deepseek-ai/DeepSeek-V4-Pro'])(
+    'normalizes the official SiliconFlow trailing slash for reasoning: %s', modelName => {
+    expect(resolveModelProfileReasoningMapping({ provider: 'siliconflow', protocol: 'openai',
+      baseUrl: 'https://api.siliconflow.cn/v1/', modelName }))
+      .toMatchObject({ adapter: 'siliconflow-v4-thinking' })
+  })
+
+  it.each([
+    'https://api.siliconflow.cn/v1',
+    'https://api.siliconflow.cn/v1/',
+    'https://api.siliconflow.com/v1',
+  ])('resolves the exact SiliconFlow model budget on an official endpoint: %s', (baseUrl) => {
+    for (const [modelName, sourceUrl] of [
+      ['deepseek-ai/DeepSeek-V4-Flash', 'https://www.siliconflow.com/models/deepseek-v4-flash'],
+      ['deepseek-ai/DeepSeek-V4-Pro', 'https://www.siliconflow.com/models/deepseek-v4-pro'],
+    ]) {
+      const profile = { provider: 'siliconflow', protocol: 'openai', baseUrl, modelName }
+      expect(resolveModelProfileBudgetCapabilities(profile)).toEqual({
+        contextWindowTokens: 1_000_000,
+        maxOutputTokens: 393_000,
+        evidence: { sourceUrl, calibration: 'conservative-provider-documentation' },
+      })
+      if (baseUrl === 'https://api.siliconflow.com/v1') expect(resolveModelProfileReasoningMapping(profile)).toBeUndefined()
+    }
+  })
+
+  it.each([
+    { baseUrl: 'https://proxy.example.test/v1', modelName: 'deepseek-ai/DeepSeek-V4-Flash' },
+    { baseUrl: 'https://proxy.example.test/v1', modelName: 'deepseek-ai/DeepSeek-V4-Pro' },
+    { baseUrl: 'https://api.siliconflow.cn/v1', modelName: 'deepseek-ai/DeepSeek-V4-Pro-2026' },
+    { baseUrl: 'http://api.siliconflow.cn/v1', modelName: 'deepseek-ai/DeepSeek-V4-Flash' },
+    { baseUrl: 'https://api.siliconflow.cn', modelName: 'deepseek-ai/DeepSeek-V4-Flash' },
+    { baseUrl: 'https://api.siliconflow.cn/v1?tenant=x', modelName: 'deepseek-ai/DeepSeek-V4-Flash' },
+    { baseUrl: 'https://api.siliconflow.cn/v1', modelName: 'deepseek-ai/DeepSeek-V4-Flash-Pro' },
+    { baseUrl: 'https://api.siliconflow.cn/v1', modelName: 'deepseek-ai/DeepSeek-V4-Flash-2026' },
+    { baseUrl: 'https://api.siliconflow.cn/v1', modelName: 'DeepSeek-V4-Flash' },
+  ])('does not infer SiliconFlow budget facts for $baseUrl / $modelName', ({ baseUrl, modelName }) => {
+    expect(resolveModelProfileBudgetCapabilities({
+      provider: 'siliconflow',
+      protocol: 'openai',
+      baseUrl,
+      modelName,
+      capabilities: {
+        contextWindowTokens: 2_000_000,
+        maxOutputTokens: 999_999,
+        reasoning: true,
+        structuredOutput: true,
+        usage: true,
+      },
+    })).toBeUndefined()
+  })
+  it.each([
+    [{ provider: 'ollama', baseUrl: '' }, true],
+    [{ provider: 'custom', baseUrl: 'http://localhost:11434/v1' }, true],
+    [{ provider: 'custom', baseUrl: ' http://127.0.0.1:1234/v1 ' }, true],
+    [{ provider: 'custom', baseUrl: 'http://[::1]:8080' }, true],
+    [{ provider: 'custom', baseUrl: 'https://api.openai.com/v1' }, false],
+    [{ provider: 'custom', baseUrl: 'localhost:1234' }, false],
+    [{ provider: 'custom', baseUrl: 'file://localhost/models' }, false],
+    [{ provider: 'custom', baseUrl: 'ws://localhost:1234' }, false],
+  ])('treats %o as a local model endpoint: %s', (endpoint, local) => {
+    expect(isLocalModelEndpoint(endpoint)).toBe(local)
+  })
+})

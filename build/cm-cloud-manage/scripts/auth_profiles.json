@@ -1,0 +1,22 @@
+{
+  "schemaVersion": "1.0",
+  "defaultProfile": "default",
+  "profiles": {
+    "default": {
+      "devId": "1403",
+      "clientId": "8d9bae50e6b8439aae62ed8148e1967e",
+      "skillId": "5b00f72c4709f27dc9abd117763e0cb6",
+      "skillName": "中国移动云盘skill",
+      "strategyId": "d872deb58067415daf2c4e1883aff777",
+      "templateId": "4jqgxa3ofp6acetcuues9a8psdmexuk1",
+      "scopeIds": [
+        "10008",
+        "10009"
+      ],
+      "storage_backend": "file",
+      "auth_info_path": "~/.cmcloud/auth/{agent}/{profile}/{skillId}",
+      "clawUid_path": null,
+      "fallback_clawUid_path": "~/.cmcloud/auth/{profile}/{skillId}/fallback_clawUid.json"
+    }
+  }
+}

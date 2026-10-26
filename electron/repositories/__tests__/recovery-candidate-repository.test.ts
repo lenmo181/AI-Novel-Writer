@@ -1,0 +1,300 @@
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+
+import { closeProjectDatabase } from '../../database'
+import { openCanonicalProjectFixture as initProjectDatabase } from '../../../test/helpers/canonical-project-fixture'
+import { searchKnowledge } from '../../knowledge-base'
+import { BlueprintRepository } from '../blueprint-repository'
+import { CharacterRepository } from '../character-repository'
+import { DraftRepository } from '../draft-repository'
+import { FinalizationRepository } from '../finalization-repository'
+import { RecoveryCandidateRepository } from '../recovery-candidate-repository'
+import { SummaryRepository } from '../summary-repository'
+import { displayedErrorMessage } from '../../../src/i18n/app-errors'
+
+let projectRoot = ''
+
+const source = {
+  chapterNumber: 3,
+  title: '失控列车',
+  role: '发展',
+  purpose: '揭示追踪者',
+  keyEvents: '林岚发现列车没有司机',
+  characters: ['林岚'],
+  suspenseHook: '隧道尽头出现第二辆列车',
+  userGuidance: '保持封闭空间压迫感',
+}
+
+beforeEach(() => {
+  projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-novel-recovery-'))
+  initProjectDatabase(projectRoot)
+  BlueprintRepository.upsert({
+    ...source,
+    notes: '',
+    notesUpdatedAt: '',
+  })
+})
+
+function freezeCandidate(candidateId: string): void {
+  fs.writeFileSync(path.join(projectRoot, '.ai-novel', 'portable-runtime-freeze.json'), JSON.stringify({
+    version: 1, originProjectId: '11111111-1111-4111-8111-111111111111', snapshotGeneration: 'snapshot-1',
+    nonReplayable: true, requiresRuntimeFreezeGuard: true, avatarReferenceProjections: [], records: [{
+      projectionId: `history:recovery_candidates:${candidateId}`, table: 'recovery_candidates', recordId: candidateId,
+      terminalState: 'pending', projection: {}, projectionHash: 'a'.repeat(64), excludedFields: [],
+      nonReplayable: true, originalReceiptVerified: false,
+    }],
+  }), { mode: 0o600 })
+}
+
+afterEach(() => {
+  closeProjectDatabase()
+  fs.rmSync(projectRoot, { recursive: true, force: true })
+})
+
+describe('RecoveryCandidateRepository project-local seam', () => {
+  it('keeps imported pending history visible but refuses every old-state mutation', () => {
+    const old = RecoveryCandidateRepository.record({ runId: 'old-run', stepId: 'generate-draft', projectId: 'project-recovery', chapterNumber: 3,
+      chapterTitle: source.title, source, sourceDraft: null, visibleText: '历史恢复正文', failureCode: 'NETWORK_ERROR', failureReason: 'old' })
+    freezeCandidate(old.candidateId)
+    expect(RecoveryCandidateRepository.listPending()).toEqual([expect.objectContaining({ candidateId: old.candidateId })])
+    expect(() => RecoveryCandidateRepository.updatePending(old.candidateId, '不应写入')).toThrow('PORTABLE_RUNTIME_FROZEN')
+    expect(() => RecoveryCandidateRepository.resolve(old.candidateId, 'discarded')).toThrow('PORTABLE_RUNTIME_FROZEN')
+    const fresh = RecoveryCandidateRepository.record({ runId: 'new-run', stepId: 'generate-draft', projectId: 'project-recovery', chapterNumber: 3,
+      chapterTitle: source.title, source, sourceDraft: null, visibleText: '新恢复正文', failureCode: 'NETWORK_ERROR', failureReason: 'new' })
+    expect(() => RecoveryCandidateRepository.resolve(fresh.candidateId, 'discarded')).not.toThrow()
+    expect(RecoveryCandidateRepository.listPending().map(item => item.candidateId)).toEqual([old.candidateId])
+  })
+
+  it('persists only visible prose, survives reopen, and stays outside formal facts and search', async () => {
+    const recorded = RecoveryCandidateRepository.record({
+      runId: 'run-interrupted',
+      stepId: 'generate-draft',
+      projectId: 'project-recovery',
+      chapterNumber: 3,
+      chapterTitle: source.title,
+      source,
+      sourceDraft: null,
+      visibleText: 'reasoning: private chain</think>林岚推开驾驶室的门。',
+      failureCode: 'PROVIDER_REQUEST_FAILED',
+      failureReason: 'connection reset',
+    })
+
+    closeProjectDatabase()
+    initProjectDatabase(projectRoot)
+
+    expect(RecoveryCandidateRepository.listPending()).toEqual([
+      expect.objectContaining({
+        candidateId: recorded.candidateId,
+        runId: 'run-interrupted',
+        stepId: 'generate-draft',
+        projectId: 'project-recovery',
+        chapterNumber: 3,
+        chapterTitle: source.title,
+        visibleText: '林岚推开驾驶室的门。',
+        failureCode: 'PROVIDER_REQUEST_FAILED',
+        failureReason: 'connection reset',
+        status: 'pending',
+        sourceCurrent: true,
+        replacesCandidateId: null,
+      }),
+    ])
+
+    expect(DraftRepository.listAll()).toEqual([])
+    expect(FinalizationRepository.listAuthoritativeForExport()).toEqual([])
+    expect(CharacterRepository.getAll()).toEqual([])
+    expect(SummaryRepository.listFinalizedContinuityBefore(4)).toEqual([])
+    await expect(searchKnowledge(
+      '驾驶室',
+      projectRoot,
+      'openai',
+      { provider: 'openai', baseUrl: '', apiKey: '' },
+    )).resolves.toEqual([])
+  })
+
+  it('drops every prefix before an orphan thinking close tag', () => {
+    const recorded = RecoveryCandidateRepository.record({
+      runId: 'run-hidden-prefix',
+      stepId: 'generate-draft',
+      projectId: 'project-recovery',
+      chapterNumber: 3,
+      chapterTitle: source.title,
+      source,
+      sourceDraft: null,
+      visibleText: 'Let me inspect the scene constraints first.</think>林岚推开驾驶室的门。',
+      failureCode: 'PROVIDER_REQUEST_FAILED',
+      failureReason: 'connection reset',
+    })
+
+    expect(recorded.visibleText).toBe('林岚推开驾驶室的门。')
+  })
+
+  it('updates a pending candidate durably without creating formal project facts', async () => {
+    const recorded = RecoveryCandidateRepository.record({
+      runId: 'run-editable',
+      stepId: 'generate-draft',
+      projectId: 'project-recovery',
+      chapterNumber: 3,
+      chapterTitle: source.title,
+      source,
+      sourceDraft: null,
+      visibleText: '初始恢复正文',
+      failureCode: 'PROVIDER_REQUEST_FAILED',
+      failureReason: 'connection reset',
+    })
+
+    RecoveryCandidateRepository.updatePending(recorded.candidateId, '作者编辑后的恢复正文')
+    closeProjectDatabase()
+    initProjectDatabase(projectRoot)
+
+    expect(RecoveryCandidateRepository.listPending()).toEqual([
+      expect.objectContaining({
+        candidateId: recorded.candidateId,
+        visibleText: '作者编辑后的恢复正文',
+        status: 'pending',
+      }),
+    ])
+    expect(DraftRepository.listAll()).toEqual([])
+    expect(FinalizationRepository.listAuthoritativeForExport()).toEqual([])
+    expect(CharacterRepository.getAll()).toEqual([])
+    expect(SummaryRepository.listFinalizedContinuityBefore(4)).toEqual([])
+    await expect(searchKnowledge(
+      '作者编辑后的恢复正文',
+      projectRoot,
+      'openai',
+      { provider: 'openai', baseUrl: '', apiKey: '' },
+    )).resolves.toEqual([])
+  })
+
+  it('marks a candidate stale when its frozen chapter source changes', () => {
+    const recorded = RecoveryCandidateRepository.record({
+      runId: 'run-stale',
+      stepId: 'generate-draft',
+      projectId: 'project-recovery',
+      chapterNumber: 3,
+      chapterTitle: source.title,
+      source,
+      sourceDraft: null,
+      visibleText: '候选正文',
+      failureCode: 'INCOMPLETE_LENGTH',
+      failureReason: 'length',
+    })
+    BlueprintRepository.upsert({
+      ...source,
+      keyEvents: '作者已经修改关键事件',
+      notes: '',
+      notesUpdatedAt: '',
+    })
+
+    expect(RecoveryCandidateRepository.listPending()[0]?.sourceCurrent).toBe(false)
+    expect(() => RecoveryCandidateRepository.resolve(recorded.candidateId, 'continued'))
+      .toThrow('RECOVERY_CANDIDATE_SOURCE_CHANGED')
+    expect(() => RecoveryCandidateRepository.resolve(recorded.candidateId, 'discarded'))
+      .not.toThrow()
+  })
+
+  it('rejects update and continue after the generation-start draft changes', () => {
+    const sourceDraftId = DraftRepository.create({
+      chapterNumber: 3,
+      source: 'write',
+      content: '生成开始时的草稿',
+      wordCount: 8,
+    })
+    const recorded = RecoveryCandidateRepository.record({
+      runId: 'run-draft-stale',
+      stepId: 'generate-draft',
+      projectId: 'project-recovery',
+      chapterNumber: 3,
+      chapterTitle: source.title,
+      source,
+      sourceDraft: { id: sourceDraftId, version: 1 },
+      visibleText: '候选正文',
+      failureCode: 'INCOMPLETE_LENGTH',
+      failureReason: 'length',
+    })
+
+    expect(recorded.sourceCurrent).toBe(true)
+    DraftRepository.create({
+      chapterNumber: 3,
+      source: 'rewrite',
+      content: '后来保存的新版本',
+      wordCount: 8,
+    })
+
+    expect(RecoveryCandidateRepository.listPending()[0]?.sourceCurrent).toBe(false)
+    expect(() => RecoveryCandidateRepository.updatePending(recorded.candidateId, '编辑后的候选'))
+      .toThrow('RECOVERY_CANDIDATE_SOURCE_CHANGED')
+    expect(() => RecoveryCandidateRepository.resolve(recorded.candidateId, 'continued'))
+      .toThrow('RECOVERY_CANDIDATE_SOURCE_CHANGED')
+  })
+
+  it('keeps the original-to-replacement relation and resolves explicitly', () => {
+    const original = RecoveryCandidateRepository.record({
+      runId: 'run-rewrite',
+      stepId: 'generate-draft',
+      projectId: 'project-recovery',
+      chapterNumber: 3,
+      chapterTitle: source.title,
+      source,
+      sourceDraft: null,
+      visibleText: '原始候选',
+      failureCode: 'LENGTH_REPAIR_FAILED',
+      failureReason: 'replacement failed',
+    })
+    const replacement = RecoveryCandidateRepository.record({
+      runId: 'run-rewrite',
+      stepId: 'length-repair',
+      projectId: 'project-recovery',
+      chapterNumber: 3,
+      chapterTitle: source.title,
+      source,
+      sourceDraft: null,
+      visibleText: '替代候选',
+      failureCode: 'LENGTH_REPAIR_FAILED',
+      failureReason: 'replacement failed',
+      replacesCandidateId: original.candidateId,
+    })
+
+    expect(RecoveryCandidateRepository.listPending().map(candidate => ({
+      candidateId: candidate.candidateId,
+      replacesCandidateId: candidate.replacesCandidateId,
+    }))).toEqual([
+      { candidateId: original.candidateId, replacesCandidateId: null },
+      { candidateId: replacement.candidateId, replacesCandidateId: original.candidateId },
+    ])
+
+    RecoveryCandidateRepository.resolve(original.candidateId, 'discarded')
+    RecoveryCandidateRepository.resolve(replacement.candidateId, 'continued')
+
+    expect(RecoveryCandidateRepository.listPending()).toEqual([])
+    // 已处理的恢复稿再保存或再处理：稳定码，界面按语言说明（#474）。
+    expect(() => RecoveryCandidateRepository.resolve(original.candidateId, 'discarded')).toThrow(/^RECOVERY_CANDIDATE_NOT_PENDING$/u)
+    expect(() => RecoveryCandidateRepository.updatePending(replacement.candidateId, '再改一次')).toThrow(/^RECOVERY_CANDIDATE_NOT_PENDING$/u)
+  })
+
+  // 重复点击或两个窗口各采用一次：第二次要说「已处理」，不能说来源变了、让作者重新生成（#484）。
+  it.each(['continued', 'discarded'] as const)('reports an already-%s candidate as handled when it is continued again', first => {
+    const recorded = RecoveryCandidateRepository.record({
+      runId: `run-repeat-${first}`,
+      stepId: 'generate-draft',
+      projectId: 'project-recovery',
+      chapterNumber: 3,
+      chapterTitle: source.title,
+      source,
+      sourceDraft: null,
+      visibleText: '候选正文',
+      failureCode: 'INCOMPLETE_LENGTH',
+      failureReason: 'length',
+    })
+    RecoveryCandidateRepository.resolve(recorded.candidateId, first)
+
+    let failure: unknown
+    try { RecoveryCandidateRepository.resolve(recorded.candidateId, 'continued') } catch (error) { failure = error }
+
+    // db:recovery-candidate-resolve 把报错按 String(error) 交给界面。
+    expect(String(failure)).toBe('Error: RECOVERY_CANDIDATE_NOT_PENDING')
+    expect(displayedErrorMessage('zh-CN', String(failure))).toBe('这份恢复稿已经处理过（已采用或已丢弃），请刷新后再看。')
+    expect(displayedErrorMessage('en-US', String(failure))).toBe('This recovered draft was already handled (used or discarded). Refresh to see the current state.')
+  })
+})

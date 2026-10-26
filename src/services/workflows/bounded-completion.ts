@@ -1,0 +1,296 @@
+import { buildStructuredReplacementPrompt } from '../../shared/structured-replacement-prompt'
+import { composeVisibleContinuation, CONTINUATION_VISIBLE_TAIL_CHARS } from '../../shared/visible-continuation'
+import {
+  assertMechanicallyCompleteVisibleText,
+  visibleProseUnitCount,
+} from '../../shared/visible-text-integrity'
+import type { LLMFinishReason } from '../../shared/ipc-channels'
+import type { WritingLanguage } from '../../shared/writing-language'
+import { localize, type Locale } from '../../i18n/core'
+import { promptLanguageText } from '../prompt-language'
+import { stripThinkingTags } from './workflow-utils'
+
+const MAX_BOUNDED_CONTINUATIONS = 7
+const MAX_STRUCTURED_CONTINUATIONS = 2
+const MAX_TEXT_CONTINUATIONS = 3
+
+export type BoundedCompletionMode = 'append-visible-text' | 'replace-structured-output'
+
+export interface BoundedCompletion {
+  content: string
+  finishReason: LLMFinishReason
+}
+
+/** A non-stop terminal model state that made a bounded completion fail closed. */
+export type BoundedCompletionFailureCode = Exclude<LLMFinishReason, 'stop'>
+
+/**
+ * Carries the provider-neutral terminal reason without changing the user-safe
+ * message used by commands and workflow logs.
+ */
+export class BoundedCompletionFailure extends Error {
+  readonly failureCode: BoundedCompletionFailureCode
+
+  constructor(failureCode: BoundedCompletionFailureCode, message: string) {
+    super(message)
+    this.name = 'BoundedCompletionFailure'
+    this.failureCode = failureCode
+    Object.setPrototypeOf(this, new.target.prototype)
+  }
+}
+
+export function getBoundedCompletionFailureCode(
+  error: unknown,
+): BoundedCompletionFailureCode | undefined {
+  return error instanceof BoundedCompletionFailure ? error.failureCode : undefined
+}
+
+export interface BoundedCompletionRequest {
+  initial: BoundedCompletion
+  mode: BoundedCompletionMode
+  maxContinuations: number
+  originalPrompt: string
+  writingLanguage: WritingLanguage
+  uiLocale?: Locale
+  sourceText?: string
+  preserveCompleteStructuredPrompt?: boolean
+  requestContinuation: (prompt: string) => Promise<BoundedCompletion>
+  isCancelled?: () => boolean
+  redactVisibleText?: (text: string) => string
+  mergeVisibleText?: (existing: string, addition: string) => string
+  /**
+   * Called with the latest merged visible content just before a failure that
+   * still leaves recoverable text behind (automatic continuations exhausted,
+   * no-progress stop, or a mechanically-incomplete stop). Callers may persist
+   * the partial result so a later user-initiated continuation can resume from
+   * where the output actually stopped. Not called for cancellations,
+   * content-filter stops, or unknown terminal states where the visible text is
+   * not trustworthy.
+   */
+  onInterrupted?: (content: string) => void
+}
+
+/** Remove hidden reasoning and malformed thinking-tag remnants before any continuation context is composed. */
+export function redactVisibleCompletionText(text: string): string {
+  return stripThinkingTags(text)
+}
+
+function noVisibleContinuationProgressError(uiLocale: Locale): Error {
+  return new Error(localize(
+    uiLocale,
+    'AI 续写未增加新的可见正文，结果未被保存。请重试或缩短本次修改范围。',
+    'The AI continuation added no new visible prose, so the result was not saved. Try again or shorten the requested edit.',
+  ))
+}
+
+/**
+ * Join a visible text continuation without letting the repeated prompt tail
+ * count as newly generated content. Callers may supply their own domain
+ * sanitizer (draft generation removes UI residue and duplicate paragraphs).
+ */
+export function appendVisibleTextContinuation(
+  existing: string,
+  addition: string,
+  redactVisibleText: (text: string) => string = redactVisibleCompletionText,
+): string {
+  const visibleExisting = redactVisibleText(existing)
+  const visibleAddition = redactVisibleText(addition)
+  return redactVisibleText(composeVisibleContinuation(visibleExisting, visibleAddition))
+}
+
+function incompleteCompletionError(
+  finishReason: LLMFinishReason,
+  uiLocale: Locale,
+): BoundedCompletionFailure {
+  // `stop` should not reach this path, but preserve fail-closed behavior if a
+  // legacy caller does invoke the public helper with it.
+  const failureCode: BoundedCompletionFailureCode = finishReason === 'stop'
+    ? 'unknown'
+    : finishReason
+
+  switch (finishReason) {
+    case 'length':
+      return new BoundedCompletionFailure(
+        failureCode,
+        localize(
+          uiLocale,
+          'AI 输出达到本次请求长度限制，尚未完整生成。请缩短本次任务或拆分为更小批次后重试。',
+          'AI output reached this request length limit and is not yet complete. Shorten the task or split it into smaller batches, then try again.',
+        ),
+      )
+    case 'content_filter':
+      return new BoundedCompletionFailure(failureCode, localize(
+        uiLocale,
+        'AI 输出因内容限制而未完成，结果未被保存。',
+        'AI output was stopped by content restrictions, so the result was not saved.',
+      ))
+    case 'cancelled':
+      return new BoundedCompletionFailure(failureCode, localize(
+        uiLocale,
+        'AI 生成已取消，结果未被保存。',
+        'AI generation was cancelled, so the result was not saved.',
+      ))
+    default:
+      return new BoundedCompletionFailure(failureCode, localize(
+        uiLocale,
+        'AI 未正常完成生成，结果未被保存。',
+        'AI generation did not complete normally, so the result was not saved.',
+      ))
+  }
+}
+
+export function createBoundedCompletionError(
+  finishReason: LLMFinishReason,
+  uiLocale: Locale = 'zh-CN',
+): BoundedCompletionFailure {
+  return incompleteCompletionError(finishReason, uiLocale)
+}
+
+function continuationLimitExceededError(maxContinuations: number, uiLocale: Locale): Error {
+  return new Error(
+    localize(
+      uiLocale,
+      `AI 输出连续达到本次请求长度限制，已自动续写 ${maxContinuations} 次，尚未完整生成。` +
+        '请缩短本次任务，或拆分为更小批次后重试。',
+      `AI output repeatedly reached this request length limit. Automatic continuation ran ${maxContinuations} ` +
+        `${maxContinuations === 1 ? 'time' : 'times'}, but the output is not yet complete. ` +
+        'Shorten the task or split it into smaller batches, then try again.',
+    ),
+  )
+}
+
+function assertNotCancelled(uiLocale: Locale, isCancelled?: () => boolean): void {
+  if (isCancelled?.()) throw new Error(localize(uiLocale, '工作流已取消', 'Workflow was cancelled.'))
+}
+
+function modeContinuationLimit(mode: BoundedCompletionMode): number {
+  return mode === 'replace-structured-output'
+    ? MAX_STRUCTURED_CONTINUATIONS
+    : MAX_TEXT_CONTINUATIONS
+}
+
+function assertValidContinuationLimit(
+  mode: BoundedCompletionMode,
+  maxContinuations: number,
+  uiLocale: Locale,
+): void {
+  if (
+    !Number.isSafeInteger(maxContinuations)
+    || maxContinuations < 0
+    || maxContinuations > MAX_BOUNDED_CONTINUATIONS
+  ) {
+    throw new Error(localize(
+      uiLocale,
+      `自动续写次数必须是 0 到 ${MAX_BOUNDED_CONTINUATIONS} 的整数。请缩短任务或提高模型最大输出 Tokens 后重试。`,
+      `The automatic-continuation limit must be an integer from 0 to ${MAX_BOUNDED_CONTINUATIONS}. Shorten the task or increase the maximum output tokens, then try again.`,
+    ))
+  }
+  const modeLimit = modeContinuationLimit(mode)
+  if (maxContinuations > modeLimit) {
+    throw new Error(localize(
+      uiLocale,
+      `当前输出类型最多自动续写 ${modeLimit} 次。` +
+        '请缩短本次任务、提高模型最大输出 Tokens，或拆分为更小批次后重试。',
+      `This output type allows at most ${modeLimit} automatic continuations. ` +
+        'Shorten the task, increase the maximum output tokens, or split it into smaller batches and try again.',
+    ))
+  }
+}
+
+function buildTextContinuationPrompt(
+  originalPrompt: string,
+  visibleText: string,
+  writingLanguage: WritingLanguage,
+): string {
+  const visibleTail = visibleText.slice(-CONTINUATION_VISIBLE_TAIL_CHARS)
+  return promptLanguageText(
+    writingLanguage,
+    `上一轮文本因长度限制而中断。请继续完成原始任务。\n\n`
+      + `【原始任务】\n${originalPrompt}\n\n`
+      + `【已完成可见文本末尾】\n${visibleTail || '（没有可用输出）'}\n\n`
+      + `【硬性要求】\n`
+      + `- 只输出新增的可见文本，不要复述、总结、解释、Markdown 或思考过程。\n`
+      + `- 从已完成文本的末尾自然续写，完成原始任务。`,
+    `The previous text stopped at the length limit. Continue and complete the original task.\n\n`
+      + `[Original task]\n${originalPrompt}\n\n`
+      + `[End of the completed visible text]\n${visibleTail || '(no visible output)'}\n\n`
+      + `[Requirements]\n`
+      + `- Output only new visible prose. Do not repeat, summarize, explain, use Markdown, or reveal reasoning.\n`
+      + `- Continue naturally from the end of the completed text and finish the original task.`,
+  )
+}
+
+/**
+ * Complete one LLM task through a bounded, fail-closed continuation loop.
+ * A `stop` completion is the only successful terminal state. Structured
+ * outputs replace a partial response, while visible prose is overlap-merged.
+ */
+export async function completeBoundedCompletion(request: BoundedCompletionRequest): Promise<string> {
+  const uiLocale = request.uiLocale ?? 'zh-CN'
+  assertValidContinuationLimit(request.mode, request.maxContinuations, uiLocale)
+  const redact = request.redactVisibleText ?? redactVisibleCompletionText
+  const merge = request.mergeVisibleText ?? appendVisibleTextContinuation
+  let content = redact(request.initial.content)
+  let finishReason = request.initial.finishReason
+  let continuationCount = 0
+
+  while (finishReason !== 'stop') {
+    assertNotCancelled(uiLocale, request.isCancelled)
+    if (finishReason !== 'length') throw incompleteCompletionError(finishReason, uiLocale)
+    if (continuationCount >= request.maxContinuations) {
+      request.onInterrupted?.(content)
+      throw continuationLimitExceededError(request.maxContinuations, uiLocale)
+    }
+
+    // 构建续写提示或等待续写响应期间失败时，上一轮已收到的可见内容仍然
+    // 是可恢复的部分成果：先交给 onInterrupted 再抛出，避免调用方把
+    // 「首轮有效、续写请求失败」误判为零成果。
+    let continuationPrompt: string
+    let next: BoundedCompletion
+    try {
+      continuationPrompt = request.mode === 'replace-structured-output'
+        ? buildStructuredReplacementPrompt(
+            request.originalPrompt,
+            content,
+            request.writingLanguage,
+          )
+        : buildTextContinuationPrompt(
+            request.originalPrompt,
+            content,
+            request.writingLanguage,
+          )
+      next = await request.requestContinuation(continuationPrompt)
+    } catch (error) {
+      request.onInterrupted?.(content)
+      throw error
+    }
+    assertNotCancelled(uiLocale, request.isCancelled)
+    continuationCount += 1
+    const nextVisible = redact(next.content)
+    if (request.mode === 'replace-structured-output') {
+      content = nextVisible
+    } else {
+      const merged = merge(content, nextVisible)
+      if (visibleProseUnitCount(merged) <= visibleProseUnitCount(content)) {
+        request.onInterrupted?.(content)
+        throw noVisibleContinuationProgressError(uiLocale)
+      }
+      content = merged
+    }
+    finishReason = next.finishReason
+  }
+
+  assertNotCancelled(uiLocale, request.isCancelled)
+  if (request.mode === 'append-visible-text') {
+    try {
+      assertMechanicallyCompleteVisibleText(content, uiLocale, request.sourceText)
+    } catch (error) {
+      // The merged text may be a usable partial document even when it cannot
+      // be mechanically confirmed as complete (e.g. a leftover truncation
+      // marker). Hand it back before failing closed.
+      request.onInterrupted?.(content)
+      throw error
+    }
+  }
+  return content
+}

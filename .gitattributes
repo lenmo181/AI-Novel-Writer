@@ -1,0 +1,31 @@
+# Keep source and release contracts byte-stable across Windows and POSIX checkouts.
+* text=auto eol=lf
+
+# Windows command scripts are the only text artifacts that require CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary release and documentation assets must never be line-normalized.
+*.dll binary
+*.dmg binary
+*.exe binary
+*.gif binary
+*.ico binary
+*.jpeg binary
+*.jpg binary
+*.mp4 binary
+*.pdf binary
+*.png binary
+*.ttf binary
+*.webm binary
+*.woff binary
+*.woff2 binary
+*.zip binary
+
+# Independently audited planning packages contain frozen byte-level manifests.
+# Preserve their original line endings so checkout cannot invalidate the audit.
+docs/plans/novel-quality-modernization/** -text
+docs/plans/novel-quality-program-2026-09-13/** -text
+docs/plans/novel-quality-program-v3-2026-09-13/** -text
+docs/plans/NOVEL-QUALITY-CURRENT.md -text

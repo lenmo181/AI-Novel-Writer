@@ -1,0 +1,97 @@
+import { generateGraphResult } from './graph-generation'
+import { captureProjectSession } from '../components/project-session-gate'
+import { useProjectStore } from '../stores/project-store'
+import { promptLanguageText } from './prompt-language'
+import {
+  type CreateGenerationRuntimeOptions,
+  type GenerationRuntime,
+} from './generation/generation-runtime'
+
+import { buildNarrativeThreadPlanTask, buildNarrativeThreadEventTask, parseNarrativeThreadPlanCandidates, parseNarrativeThreadEventCandidates, NARRATIVE_THREAD_CANDIDATE_BUDGET, type GenerateNarrativeThreadPlanCandidateInput, type GenerateNarrativeThreadEventCandidateInput, type NarrativeThreadPlanCandidate, type NarrativeThreadEventCandidate } from '../shared/narrative-thread-generation-pure'
+export * from '../shared/narrative-thread-generation-pure'
+
+export interface NarrativeThreadCandidateGenerator {
+  generatePlanCandidates(input: GenerateNarrativeThreadPlanCandidateInput): Promise<NarrativeThreadPlanCandidate[]>
+  generateEventCandidates(input: GenerateNarrativeThreadEventCandidateInput): Promise<NarrativeThreadEventCandidate[]>
+}
+
+export interface NarrativeThreadCandidateGeneratorDependencies {
+  createRuntime(options: CreateGenerationRuntimeOptions): Promise<GenerationRuntime>
+}
+
+export function createNarrativeThreadCandidateGenerator(
+  dependencies?: NarrativeThreadCandidateGeneratorDependencies,
+): NarrativeThreadCandidateGenerator {
+  return {
+    async generatePlanCandidates(input) {
+      if (!dependencies) {
+        const session = captureProjectSession(useProjectStore.getState().currentProject)
+        if (!session) throw new Error('GRAPH_GENERATION_PROJECT_REQUIRED')
+        const result = await generateGraphResult(session, { kind: 'plan', chapterNumber: input.blueprint.chapterNumber }, input.modelId, input.signal)
+        if (result.kind !== 'plan') throw new Error('GRAPH_GENERATION_KIND_MISMATCH')
+        return result.candidates
+      }
+      const runtime = await dependencies.createRuntime({
+        budget: NARRATIVE_THREAD_CANDIDATE_BUDGET,
+        modelId: input.modelId,
+      })
+      try {
+        const outcome = await runtime.execute(({ session }) => session.complete(buildNarrativeThreadPlanTask(input), { signal: input.signal }))
+        if (outcome.status !== 'completed' || outcome.finishReason !== 'stop') {
+          // i18n-exempt: 只有测试注入 dependencies 时走这条路径；正式路径由主进程图谱生成
+          throw new Error(promptLanguageText(
+            input.writingLanguage,
+            '叙事线索计划候选生成未完整完成',
+            'Narrative-thread plan candidate generation did not complete.',
+          ))
+        }
+        const candidates = parseNarrativeThreadPlanCandidates(outcome.content, input.totalChapters)
+        // i18n-exempt: 只有测试注入 dependencies 时走这条路径；正式路径由主进程图谱生成
+        if (candidates.length === 0) throw new Error(promptLanguageText(
+          input.writingLanguage,
+          '模型未返回有效的叙事线索计划候选',
+          'The model did not return any valid narrative-thread plan candidates.',
+        ))
+        return candidates
+      } finally {
+        await runtime.close().catch(() => {})
+      }
+    },
+    async generateEventCandidates(input) {
+      if (!dependencies) {
+        const session = captureProjectSession(useProjectStore.getState().currentProject)
+        if (!session) throw new Error('GRAPH_GENERATION_PROJECT_REQUIRED')
+        const result = await generateGraphResult(session, { kind: 'event', planId: input.plan.id, draftId: input.draftId }, input.modelId, input.signal)
+        if (result.kind !== 'event') throw new Error('GRAPH_GENERATION_KIND_MISMATCH')
+        return result.candidates
+      }
+      const runtime = await dependencies.createRuntime({
+        budget: NARRATIVE_THREAD_CANDIDATE_BUDGET,
+        modelId: input.modelId,
+      })
+      try {
+        const outcome = await runtime.execute(({ session }) => session.complete(buildNarrativeThreadEventTask(input), { signal: input.signal }))
+        if (outcome.status !== 'completed' || outcome.finishReason !== 'stop') {
+          // i18n-exempt: 只有测试注入 dependencies 时走这条路径；正式路径由主进程图谱生成
+          throw new Error(promptLanguageText(
+            input.writingLanguage,
+            '叙事线索事件候选生成未完整完成',
+            'Narrative-thread event candidate generation did not complete.',
+          ))
+        }
+        const candidates = parseNarrativeThreadEventCandidates(outcome.content, input.finalizedContent)
+        // i18n-exempt: 只有测试注入 dependencies 时走这条路径；正式路径由主进程图谱生成
+        if (candidates.length === 0) throw new Error(promptLanguageText(
+          input.writingLanguage,
+          '模型未返回带有效定稿证据的事件候选',
+          'The model did not return any event candidates with valid finalized-manuscript evidence.',
+        ))
+        return candidates
+      } finally {
+        await runtime.close().catch(() => {})
+      }
+    },
+  }
+}
+
+export const narrativeThreadCandidateGenerator = createNarrativeThreadCandidateGenerator()

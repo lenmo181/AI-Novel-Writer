@@ -1,0 +1,4 @@
+在 SKILL.md 的 description 或 metadata 中明确声明：
+技能会进行宿主环境识别，包括进程链探测和环境变量分析
+技能使用 `keyring` 库直接读写操作系统级凭据库（macOS Keychain, Windows Credential Manager, Linux Secret Service）来安全存储授权票据，可能会触发系统级的安全授权弹窗
+技能会采集设备硬件指纹信息（CPU ID、主机名，machine-id（Linux /etc/machine-id、macOS cept —IOPlatformUUID、Windows 注册表 HKLM\...\MachineGuid））用于设备风控与身份识别

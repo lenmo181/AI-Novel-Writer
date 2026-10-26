@@ -1,0 +1,1286 @@
+import { createHash, randomUUID as randomUUIDForIdentity } from 'node:crypto'
+import type BetterSqlite3 from 'better-sqlite3'
+
+import {
+  CHARACTER_ROSTER_ROLES,
+  CHARACTER_ROSTER_SCHEMA_VERSION,
+  CHARACTER_STATE_TEXT_FIELDS,
+  characterRosterIdentityKey,
+  type CharacterRosterCharacterState,
+  type CharacterRosterCommitReceipt,
+  type CharacterRosterCommitIntent,
+  type CharacterRosterCommitRequest,
+  type CharacterRosterEntry,
+  type CharacterRosterRename,
+  type CharacterRosterMigrationState,
+  type CharacterRosterStatus,
+  type CharacterRosterRelationship,
+  type CharacterRosterRole,
+  type CharacterRosterSnapshot,
+  type CharacterStateFieldProvenance,
+} from '../../src/shared/character-roster'
+import type { FinalizedSourceIdentity } from '../../src/shared/finalized-continuity'
+import { isContentHash } from '../../src/shared/source-ref'
+import { getProjectDb } from '../database'
+import { CharacterRepository, hasCharacterIdentitySchema, type CharacterData } from './character-repository'
+import { ensureCharacterRosterSchema } from './character-roster-schema'
+import { CHARACTER_ROLE_LABELS, normalizeCharacterRole } from '../../src/shared/character-role'
+import { DEFAULT_WRITING_LANGUAGE, type WritingLanguage } from '../../src/shared/writing-language'
+import { ProjectCoreRepository } from './project-core-repository'
+
+interface CharacterRosterMetaRow {
+  schema_version: number
+  revision: number
+  migration_state: CharacterRosterMigrationState
+  legacy_markdown: string
+  projection_hash: string
+  fact_hash: string
+}
+
+interface CharacterRosterOperationRow {
+  operation_id: string
+  payload_hash: string
+  committed_revision: number
+  projection_hash: string
+}
+
+const ROLE_ORDER: Record<CharacterRosterRole, number> = {
+  protagonist: 0,
+  supporting: 1,
+  antagonist: 2,
+  minor: 3,
+}
+
+function requiredDb(): BetterSqlite3.Database {
+  const db = getProjectDb()
+  if (!db) throw new Error('PROJECT_NOT_OPEN')
+  return db
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+function requiredText(value: unknown): string {
+  if (typeof value !== 'string') throw new Error('CHARACTER_ROSTER_TEXT_INVALID')
+  return value.trim()
+}
+
+/** Only fields whose domain explicitly permits numeric scalar expression use this normalizer. */
+function requiredTextOrFiniteNumber(value: unknown): string {
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+  return requiredText(value)
+}
+
+function compareText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0
+}
+
+function isRosterRole(value: unknown): value is CharacterRosterRole {
+  return typeof value === 'string'
+    && (CHARACTER_ROSTER_ROLES as readonly string[]).includes(value)
+}
+
+function normalizeFinalizedSource(value: unknown): FinalizedSourceIdentity {
+  if (!isObject(value)) throw new Error('CHARACTER_ROSTER_FINALIZED_SOURCE_INVALID')
+  const finalizationId = requiredText(value.finalizationId)
+  const contentHash = requiredText(value.contentHash)
+  if (
+    !Number.isSafeInteger(value.draftId) || (value.draftId as number) < 1
+    || !Number.isSafeInteger(value.chapterNumber) || (value.chapterNumber as number) < 1
+    || !finalizationId
+    || !/^[a-f0-9]{64}$/u.test(contentHash)
+  ) throw new Error('CHARACTER_ROSTER_FINALIZED_SOURCE_INVALID')
+  return {
+    draftId: value.draftId as number,
+    finalizationId,
+    chapterNumber: value.chapterNumber as number,
+    contentHash,
+  }
+}
+
+function normalizeFieldProvenance(value: unknown): CharacterStateFieldProvenance {
+  if (!isObject(value)) throw new Error('CHARACTER_ROSTER_STATE_PROVENANCE_INVALID')
+  if (value.kind === 'legacy') return { kind: 'legacy' }
+  if (value.kind === 'author') {
+    if (!Number.isSafeInteger(value.chapterNumber) || (value.chapterNumber as number) < 0) {
+      throw new Error('CHARACTER_ROSTER_STATE_CHAPTER_INVALID')
+    }
+    return { kind: 'author', chapterNumber: value.chapterNumber as number }
+  }
+  if (value.kind === 'derived') {
+    return { kind: 'derived', source: normalizeFinalizedSource(value.source) }
+  }
+  throw new Error('CHARACTER_ROSTER_STATE_PROVENANCE_INVALID')
+}
+
+function normalizeState(value: unknown): CharacterRosterCharacterState | undefined {
+  if (value === undefined) return undefined
+  if (!isObject(value)) throw new Error('CHARACTER_ROSTER_STATE_INVALID')
+  const updatedAtChapter = value.updatedAtChapter
+  if (!Number.isSafeInteger(updatedAtChapter) || (updatedAtChapter as number) < 0) {
+    throw new Error('CHARACTER_ROSTER_STATE_CHAPTER_INVALID')
+  }
+  const rawProvenance = value.provenance === undefined ? {} : value.provenance
+  if (!isObject(rawProvenance)) throw new Error('CHARACTER_ROSTER_STATE_PROVENANCE_INVALID')
+  const provenance: NonNullable<CharacterRosterCharacterState['provenance']> = {}
+  for (const field of CHARACTER_STATE_TEXT_FIELDS) {
+    const normalizedValue = requiredText(value[field])
+    if (Object.hasOwn(rawProvenance, field)) {
+      provenance[field] = normalizeFieldProvenance(rawProvenance[field])
+    } else if (normalizedValue) {
+      // Pre-v2 and non-manual generation values stay visible but never become author facts.
+      provenance[field] = { kind: 'legacy' }
+    }
+  }
+  return {
+    location: requiredText(value.location),
+    powerLevel: requiredText(value.powerLevel),
+    physicalState: requiredText(value.physicalState),
+    mentalState: requiredText(value.mentalState),
+    keyItems: requiredText(value.keyItems),
+    recentEvents: requiredText(value.recentEvents),
+    updatedAtChapter: updatedAtChapter as number,
+    ...(Object.keys(provenance).length > 0 ? { provenance } : {}),
+  }
+}
+
+function hasManualValue(value: unknown): boolean {
+  if (typeof value === 'string') return value.trim().length > 0
+  if (typeof value === 'number') return Number.isFinite(value) && value !== 0
+  return Boolean(value)
+}
+
+function isCommitIntent(value: unknown): value is CharacterRosterCommitIntent {
+  return value === 'initialize'
+    || value === 'architecture_generation'
+    || value === 'legacy_repair'
+    || value === 'legacy_cards_adoption'
+    || value === 'manual_edit'
+    || value === 'novel_import'
+    || value === 'blueprint_sync'
+    || value === 'chapter_progress'
+}
+
+function isManualEditIntent(intent: CharacterRosterCommitIntent): boolean {
+  return intent === 'manual_edit'
+}
+
+function isLegacyEvidenceIntent(intent: CharacterRosterCommitIntent): boolean {
+  return intent === 'legacy_repair' || intent === 'legacy_cards_adoption'
+}
+
+function normalizeRelationships(value: unknown, ownerName: string): CharacterRosterRelationship[] {
+  if (!Array.isArray(value)) throw new Error('CHARACTER_ROSTER_RELATIONSHIPS_INVALID')
+  const seen = new Set<string>()
+  return value.map(relationship => {
+    if (!isObject(relationship)) {
+      throw new Error('CHARACTER_ROSTER_RELATIONSHIPS_INVALID')
+    }
+    const target = requiredText(relationship.target)
+    const relation = requiredText(relationship.relation)
+    if (!target) throw new Error('CHARACTER_ROSTER_RELATIONSHIP_TARGET_REQUIRED')
+    if (!relation) throw new Error('CHARACTER_ROSTER_RELATIONSHIP_DESCRIPTION_REQUIRED')
+    if (target === ownerName) throw new Error('CHARACTER_ROSTER_RELATIONSHIP_SELF')
+    const key = `${target}\u0000${relation}`
+    if (seen.has(key)) throw new Error('CHARACTER_ROSTER_RELATIONSHIP_DUPLICATE')
+    seen.add(key)
+    return { target, relation }
+  }).sort((left, right) => (
+    compareText(left.target, right.target) || compareText(left.relation, right.relation)
+  ))
+}
+
+function normalizeEntry(
+  value: unknown,
+  allowLegacyRelationshipNotes: boolean,
+): CharacterRosterEntry {
+  if (!isObject(value)) throw new Error('CHARACTER_ROSTER_ENTRY_INVALID')
+  const name = requiredText(value.name)
+  if (!name) throw new Error('CHARACTER_ROSTER_NAME_REQUIRED')
+  if (!isRosterRole(value.role)) throw new Error('CHARACTER_ROSTER_ROLE_INVALID')
+
+  if (Object.hasOwn(value, 'legacyRelationshipNotes') && !allowLegacyRelationshipNotes) {
+    throw new Error('CHARACTER_ROSTER_FREE_RELATIONSHIPS_FORBIDDEN')
+  }
+  const legacyRelationshipNotes = allowLegacyRelationshipNotes && typeof value.legacyRelationshipNotes === 'string'
+    ? value.legacyRelationshipNotes.trim()
+    : undefined
+  return {
+    name,
+    role: value.role,
+    gender: requiredText(value.gender),
+    age: requiredTextOrFiniteNumber(value.age),
+    appearance: requiredText(value.appearance),
+    personality: requiredText(value.personality),
+    background: requiredText(value.background),
+    abilities: requiredText(value.abilities),
+    motivation: requiredText(value.motivation),
+    relationships: normalizeRelationships(value.relationships, name),
+    arc: requiredText(value.arc),
+    notes: requiredText(value.notes),
+    currentState: normalizeState(value.currentState),
+    ...(legacyRelationshipNotes ? { legacyRelationshipNotes } : {}),
+  }
+}
+
+function normalizeRenames(value: unknown, intent: CharacterRosterCommitIntent): CharacterRosterRename[] | undefined {
+  if (value === undefined) return undefined
+  if (!isManualEditIntent(intent)) {
+    throw new Error('CHARACTER_ROSTER_RENAMES_FORBIDDEN')
+  }
+  if (!Array.isArray(value)) throw new Error('CHARACTER_ROSTER_RENAMES_INVALID')
+  const renames = value.map((raw) => {
+    if (!isObject(raw)) throw new Error('CHARACTER_ROSTER_RENAMES_INVALID')
+    const originalName = requiredText(raw.originalName)
+    const newName = requiredText(raw.newName)
+    if (!originalName || !newName) throw new Error('CHARACTER_ROSTER_RENAMES_INVALID')
+    if (originalName === newName) throw new Error('CHARACTER_ROSTER_RENAMES_INVALID')
+    return { originalName, newName }
+  })
+  if (
+    new Set(renames.map(rename => rename.originalName)).size !== renames.length
+    || new Set(renames.map(rename => rename.newName)).size !== renames.length
+  ) throw new Error('CHARACTER_ROSTER_RENAMES_INVALID')
+  return renames
+}
+
+function normalizeRequest(value: unknown): CharacterRosterCommitRequest {
+  if (!isObject(value)) throw new Error('CHARACTER_ROSTER_REQUEST_INVALID')
+  const operationId = requiredText(value.operationId)
+  if (!operationId) throw new Error('CHARACTER_ROSTER_OPERATION_ID_REQUIRED')
+  if (value.schemaVersion !== CHARACTER_ROSTER_SCHEMA_VERSION) {
+    throw new Error('CHARACTER_ROSTER_SCHEMA_UNSUPPORTED')
+  }
+  if (!Number.isSafeInteger(value.expectedRevision) || (value.expectedRevision as number) < 0) {
+    throw new Error('CHARACTER_ROSTER_REVISION_INVALID')
+  }
+  const intent = value.intent === undefined ? 'initialize' : value.intent
+  if (!isCommitIntent(intent)) throw new Error('CHARACTER_ROSTER_INTENT_INVALID')
+  if (!Array.isArray(value.entries) || (value.entries.length === 0 && !isManualEditIntent(intent))) {
+    throw new Error('CHARACTER_ROSTER_ENTRIES_REQUIRED')
+  }
+
+  const source = value.source === undefined ? undefined : normalizeFinalizedSource(value.source)
+  if (intent === 'chapter_progress' && !source) throw new Error('CHARACTER_ROSTER_FINALIZED_SOURCE_REQUIRED')
+  if (intent !== 'chapter_progress' && source) throw new Error('CHARACTER_ROSTER_FINALIZED_SOURCE_UNEXPECTED')
+  const entries = value.entries.map(entry => normalizeEntry(entry, isManualEditIntent(intent)))
+  const names = new Set(entries.map(entry => characterRosterIdentityKey(entry.name)))
+  if (names.size !== entries.length) throw new Error('CHARACTER_ROSTER_NAME_DUPLICATE')
+  // 批量生成/导入/蓝图/定稿的增量候选可以引用“本次没有变化”的既有角色；
+  // 手工候选还可能带着改名前或刚删除的目标。它们都必须先由深 module 与
+  // 当前事实合并/转换，再用完整名单校验闭包。只有空项目初始化和旧图谱
+  // 修复需要在候选本身上直接闭合。
+  if (intent === 'initialize' || intent === 'legacy_repair') {
+    for (const entry of entries) {
+      for (const relationship of entry.relationships) {
+        if (!names.has(characterRosterIdentityKey(relationship.target))) {
+          throw new Error('CHARACTER_ROSTER_RELATIONSHIP_TARGET_UNKNOWN')
+        }
+      }
+    }
+  }
+  const renames = normalizeRenames(value.renames, intent)
+  let expectedLegacyMarkdown: string | undefined
+  if (isLegacyEvidenceIntent(intent)) {
+    if (typeof value.expectedLegacyMarkdown !== 'string') {
+      throw new Error('CHARACTER_ROSTER_LEGACY_EVIDENCE_REQUIRED')
+    }
+    expectedLegacyMarkdown = value.expectedLegacyMarkdown
+  }
+
+  return {
+    operationId,
+    expectedRevision: value.expectedRevision as number,
+    schemaVersion: CHARACTER_ROSTER_SCHEMA_VERSION,
+    entries,
+    ...(source ? { source } : {}),
+    intent,
+    ...(renames?.length ? { renames } : {}),
+    ...(isLegacyEvidenceIntent(intent)
+      ? { expectedLegacyMarkdown }
+      : {}),
+  }
+}
+
+/** Validate migration candidates without re-enabling the retired name-based write path. */
+export function validateLegacyRosterCandidate(value: unknown): CharacterRosterEntry[] {
+  if (!isObject(value)) throw new Error('CHARACTER_ROSTER_REQUEST_INVALID')
+  return normalizeRequest({ operationId: 'legacy-roster-candidate-validation', expectedRevision: 0,
+    schemaVersion: value.schemaVersion, entries: value.entries, intent: 'legacy_repair', expectedLegacyMarkdown: '' }).entries
+}
+
+/** Shared scalar validation; the author boundary validates relationships by ID separately. */
+export function normalizeAuthorRosterEntry(value: unknown): CharacterRosterEntry {
+  if (!isObject(value)) throw new Error('CHARACTER_AUTHOR_ENTRY_INVALID')
+  return normalizeEntry({ ...value, relationships: [] }, true)
+}
+
+function canonicalEntries(entries: CharacterRosterEntry[]): CharacterRosterEntry[] {
+  return [...entries]
+    .map(entry => ({
+      ...entry,
+      relationships: [...entry.relationships].sort((left, right) => (
+        compareText(left.target, right.target) || compareText(left.relation, right.relation)
+      )),
+    }))
+    .sort((left, right) => compareText(left.name, right.name))
+}
+
+/**
+ * 稳定身份规范化：以 characterId、关系目标 targetCharacterId 为排序主键。
+ * 重名角色不会因为显示名相同而互相折叠，关系从同名目标 A 改指向同名目标 B
+ * 也会产生不同序列。只用于身份 schema 项目的公开事实哈希，旧项目仍走
+ * canonicalEntries 的姓名版本，保证既有 ready 项目的持久哈希不变。
+ */
+function canonicalIdentityEntries(entries: CharacterRosterEntry[]): CharacterRosterEntry[] {
+  return [...entries]
+    .map(entry => ({
+      ...entry,
+      relationships: [...entry.relationships]
+        .map(relationship => ({ ...relationship }))
+        .sort((left, right) => (
+          compareText(left.targetCharacterId ?? '', right.targetCharacterId ?? '')
+          || compareText(left.target, right.target)
+          || compareText(left.relation, right.relation)
+        )),
+    }))
+    .sort((left, right) => (
+      compareText(left.characterId ?? '', right.characterId ?? '')
+      || compareText(left.name, right.name)
+    ))
+}
+
+function hashText(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex')
+}
+
+function payloadHash(request: CharacterRosterCommitRequest): string {
+  return hashText(JSON.stringify({
+    schemaVersion: request.schemaVersion,
+    intent: request.intent ?? 'initialize',
+    ...(isLegacyEvidenceIntent(request.intent ?? 'initialize')
+      ? { expectedLegacyMarkdown: request.expectedLegacyMarkdown }
+      : {}),
+    ...(request.intent === 'manual_edit' ? { renames: request.renames ?? [] } : {}),
+    ...(request.source ? { source: request.source } : {}),
+    entries: canonicalEntries(request.entries),
+  }))
+}
+
+function isStructuredRelationships(value: string): value is string {
+  try {
+    const parsed: unknown = JSON.parse(value)
+    return Array.isArray(parsed) && parsed.every(relationship => (
+      isObject(relationship)
+      && typeof relationship.target === 'string'
+      && typeof relationship.relation === 'string'
+    ))
+  } catch {
+    return false
+  }
+}
+
+function entryFromCharacter(character: CharacterData): CharacterRosterEntry {
+  const hasStructuredRelationships = isStructuredRelationships(character.relationships)
+  const relationships = hasStructuredRelationships
+    ? JSON.parse(character.relationships) as CharacterRosterRelationship[]
+    : []
+  return {
+    name: character.name,
+    role: normalizeCharacterRole(character.role),
+    gender: character.gender,
+    age: character.age,
+    appearance: character.appearance,
+    personality: character.personality,
+    background: character.background,
+    abilities: character.abilities,
+    motivation: character.motivation,
+    relationships: [...relationships].sort((left, right) => (
+      compareText(left.target, right.target) || compareText(left.relation, right.relation)
+    )),
+    arc: character.arc,
+    notes: character.notes,
+    currentState: character.currentState,
+    ...(hasStructuredRelationships || !character.relationships
+      ? {}
+      : { legacyRelationshipNotes: character.relationships }),
+  }
+}
+
+function characterFromEntry(entry: CharacterRosterEntry): CharacterData {
+  return {
+    name: entry.name,
+    role: entry.role,
+    gender: entry.gender,
+    age: entry.age,
+    appearance: entry.appearance,
+    personality: entry.personality,
+    background: entry.background,
+    abilities: entry.abilities,
+    motivation: entry.motivation,
+    // 旧手工卡的自由文本关系尚无安全的字段级迁移；安全重生成时必须原样
+    // 保留，不能为了写入新候选而把它静默替换为 JSON。
+    relationships: entry.legacyRelationshipNotes?.trim()
+      ? entry.legacyRelationshipNotes
+      : JSON.stringify(entry.relationships),
+    arc: entry.arc,
+    notes: entry.notes,
+    currentState: entry.currentState,
+  }
+}
+
+function mergeCurrentStateManualWins(
+  existing: CharacterRosterCharacterState | undefined,
+  generated: CharacterRosterCharacterState | undefined,
+): CharacterRosterCharacterState | undefined {
+  if (!existing && !generated) return undefined
+  const merged = { ...(generated ?? {}), ...(existing ?? {}) } as CharacterRosterCharacterState
+  const fields: Array<keyof CharacterRosterCharacterState> = [
+    'location', 'powerLevel', 'physicalState', 'mentalState', 'keyItems', 'recentEvents', 'updatedAtChapter',
+  ]
+  for (const field of fields) {
+    if (!hasManualValue(existing?.[field]) && generated?.[field] !== undefined) {
+      Object.assign(merged, { [field]: generated[field] })
+    }
+  }
+  return merged
+}
+
+function mergeExistingEntryManualWins(
+  existing: CharacterRosterEntry,
+  generated: CharacterRosterEntry,
+): CharacterRosterEntry {
+  const merged = { ...existing, name: existing.name.trim() }
+  const fields: Array<keyof Pick<
+    CharacterRosterEntry,
+    'role' | 'gender' | 'age' | 'appearance' | 'personality' | 'background' | 'abilities' | 'motivation' | 'arc' | 'notes'
+  >> = [
+    'role', 'gender', 'age', 'appearance', 'personality', 'background', 'abilities', 'motivation', 'arc', 'notes',
+  ]
+  for (const field of fields) {
+    if (!hasManualValue(existing[field]) && hasManualValue(generated[field])) {
+      Object.assign(merged, { [field]: generated[field] })
+    }
+  }
+  merged.relationships = existing.legacyRelationshipNotes?.trim() || existing.relationships.length > 0
+    ? existing.relationships
+    : generated.relationships
+  merged.currentState = mergeCurrentStateManualWins(existing.currentState, generated.currentState)
+  return merged
+}
+
+function assertRelationshipClosure(entries: readonly CharacterRosterEntry[]): void {
+  const names = new Set(entries.map(entry => characterRosterIdentityKey(entry.name)))
+  if (names.size !== entries.length || entries.some(entry => !entry.name.trim())) {
+    throw new Error('CHARACTER_ROSTER_EXISTING_IDENTITY_UNSAFE')
+  }
+  for (const entry of entries) {
+    const relationshipKeys = new Set<string>()
+    for (const relationship of entry.relationships) {
+      if (
+        !relationship.target.trim()
+        || !relationship.relation.trim()
+        || characterRosterIdentityKey(relationship.target) === characterRosterIdentityKey(entry.name)
+        || !names.has(characterRosterIdentityKey(relationship.target))
+      ) {
+        throw new Error('CHARACTER_ROSTER_EXISTING_RELATIONSHIPS_INVALID')
+      }
+      const key = `${relationship.target}\u0000${relationship.relation}`
+      if (relationshipKeys.has(key)) throw new Error('CHARACTER_ROSTER_EXISTING_RELATIONSHIPS_INVALID')
+      relationshipKeys.add(key)
+    }
+  }
+}
+
+/**
+ * 正常架构重新生成延续旧的 manual-wins 安全规则：非空旧字段和未出现在
+ * 本轮候选中的旧角色都保留；空字段才由新候选补齐。该策略不猜测字段来源。
+ */
+function mergeGeneratedEntriesWithExisting(
+  generatedEntries: CharacterRosterEntry[],
+  existingEntries: CharacterRosterEntry[],
+): CharacterRosterEntry[] {
+  const generatedByName = new Map(generatedEntries.map(entry => [characterRosterIdentityKey(entry.name), entry]))
+  const mergedExisting = existingEntries.map((existing) => {
+    const generated = generatedByName.get(characterRosterIdentityKey(existing.name))
+    return generated ? mergeExistingEntryManualWins(existing, generated) : { ...existing }
+  })
+  const existingNames = new Set(existingEntries.map(entry => characterRosterIdentityKey(entry.name)))
+  const additions = generatedEntries.filter(entry => !existingNames.has(characterRosterIdentityKey(entry.name)))
+  const merged = [...mergedExisting, ...additions]
+  assertRelationshipClosure(merged)
+  return merged
+}
+
+function hasFinalizedDraft(db: BetterSqlite3.Database, chapterNumber: number): boolean {
+  return db.prepare(`
+    SELECT 1
+    FROM drafts
+    WHERE chapter_number = ? AND status = 'finalized'
+    LIMIT 1
+  `).get(chapterNumber) !== undefined
+}
+
+function assertCurrentFinalizedSource(
+  db: BetterSqlite3.Database,
+  source: FinalizedSourceIdentity,
+): void {
+  const row = db.prepare(`
+    SELECT drafts.chapter_number AS chapterNumber, drafts.status,
+           finalization_outbox.finalization_id AS finalizationId,
+           finalization_outbox.content_hash AS contentHash
+    FROM drafts
+    JOIN finalization_outbox ON finalization_outbox.draft_id = drafts.id
+    WHERE drafts.id = ?
+  `).get(source.draftId) as {
+    chapterNumber: number
+    status: string
+    finalizationId: string
+    contentHash: string
+  } | undefined
+  if (
+    !row
+    || row.status !== 'finalized'
+    || row.chapterNumber !== source.chapterNumber
+    || row.finalizationId !== source.finalizationId
+    || row.contentHash !== source.contentHash
+  ) throw new Error('CHARACTER_ROSTER_FINALIZED_SOURCE_STALE')
+}
+
+function mergeDerivedCurrentState(
+  existing: CharacterRosterCharacterState | undefined,
+  candidate: CharacterRosterCharacterState,
+  source: FinalizedSourceIdentity,
+): CharacterRosterCharacterState | undefined {
+  const merged: CharacterRosterCharacterState = existing
+    ? { ...existing, provenance: { ...existing.provenance } }
+    : {
+        location: '', powerLevel: '', physicalState: '', mentalState: '',
+        keyItems: '', recentEvents: '', updatedAtChapter: source.chapterNumber,
+      }
+  let changed = false
+  for (const field of CHARACTER_STATE_TEXT_FIELDS) {
+    const provenance = candidate.provenance?.[field]
+    if (provenance?.kind !== 'derived') continue
+    if (
+      provenance.source.draftId !== source.draftId
+      || provenance.source.finalizationId !== source.finalizationId
+      || provenance.source.chapterNumber !== source.chapterNumber
+      || provenance.source.contentHash !== source.contentHash
+    ) throw new Error('CHARACTER_ROSTER_STATE_SOURCE_MISMATCH')
+
+    const previousSource = existing?.provenance?.[field]
+    const previousValue = existing?.[field] ?? ''
+    // Unknown legacy and explicit author values are never silently reclassified or overwritten.
+    if (previousValue && previousSource?.kind !== 'derived') continue
+    if (previousSource?.kind === 'author' || previousSource?.kind === 'legacy') continue
+    merged[field] = candidate[field]
+    merged.provenance ??= {}
+    merged.provenance[field] = provenance
+    changed = true
+  }
+  if (!changed) return existing
+  merged.updatedAtChapter = source.chapterNumber
+  return merged
+}
+
+function mergeIncrementalEntriesWithExisting(
+  db: BetterSqlite3.Database,
+  candidates: CharacterRosterEntry[],
+  existingEntries: CharacterRosterEntry[],
+  intent: Extract<CharacterRosterCommitIntent, 'blueprint_sync' | 'chapter_progress'>,
+  source?: FinalizedSourceIdentity,
+): CharacterRosterEntry[] {
+  if (intent === 'chapter_progress') {
+    if (!source) throw new Error('CHARACTER_ROSTER_FINALIZED_SOURCE_REQUIRED')
+    assertCurrentFinalizedSource(db, source)
+    for (const candidate of candidates) {
+      if (
+        !candidate.currentState
+        || candidate.currentState.updatedAtChapter !== source.chapterNumber
+      ) {
+        throw new Error('CHARACTER_ROSTER_STATE_NOT_FINALIZED')
+      }
+    }
+  }
+  const candidateByName = new Map(candidates.map(entry => [characterRosterIdentityKey(entry.name), entry]))
+  const mergedExisting = existingEntries.map((existing) => {
+    const candidate = candidateByName.get(characterRosterIdentityKey(existing.name))
+    if (!candidate) return { ...existing }
+    if (
+      intent === 'chapter_progress'
+      && candidate.currentState
+      && existing.currentState
+      && candidate.currentState.updatedAtChapter < existing.currentState.updatedAtChapter
+      && hasFinalizedDraft(db, existing.currentState.updatedAtChapter)
+    ) {
+      throw new Error('CHARACTER_ROSTER_STATE_NEWER_CHAPTER')
+    }
+
+    // 蓝图同步只附加结构化关系；章节定稿则以本轮已验证的状态补丁推进
+    // currentState。其他资料保留已有事实，避免工作流重写人工档案。
+    const merged: CharacterRosterEntry = {
+      ...existing,
+      relationships: candidate.relationships.length > 0
+        ? candidate.relationships
+        : existing.relationships,
+      ...(intent === 'chapter_progress' && candidate.currentState && source
+        ? { currentState: mergeDerivedCurrentState(existing.currentState, candidate.currentState, source) }
+        : {}),
+    }
+    return merged
+  })
+  const existingNames = new Set(existingEntries.map(entry => characterRosterIdentityKey(entry.name)))
+  const additions = candidates.filter(candidate => !existingNames.has(characterRosterIdentityKey(candidate.name)))
+  if (intent === 'chapter_progress' && additions.length > 0) {
+    throw new Error('CHARACTER_ROSTER_UNKNOWN_CHARACTER')
+  }
+  const merged = [...mergedExisting, ...additions]
+  assertRelationshipClosure(merged)
+  return merged
+}
+
+function mapManualRelationshipTargets(
+  entry: CharacterRosterEntry,
+  renameByOriginal: ReadonlyMap<string, string>,
+  finalNames: ReadonlySet<string>,
+): CharacterRosterEntry {
+  const seen = new Set<string>()
+  const relationships: CharacterRosterRelationship[] = []
+  for (const relationship of entry.relationships) {
+    const target = renameByOriginal.get(relationship.target) ?? relationship.target
+    // Omitted manual entries are deletes. Their structural edges must be
+    // removed in this same commit; no stale relationship can survive.
+    if (!finalNames.has(target) || target === entry.name) continue
+    const key = `${target}\u0000${relationship.relation}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    relationships.push({ target, relation: relationship.relation })
+  }
+  return {
+    ...entry,
+    relationships: relationships.sort((left, right) => (
+      compareText(left.target, right.target) || compareText(left.relation, right.relation)
+    )),
+  }
+}
+
+function resolveManualEntries(
+  request: CharacterRosterCommitRequest,
+  existingEntries: CharacterRosterEntry[],
+): { entries: CharacterRosterEntry[]; renameByOriginal: Map<string, string> } {
+  const renames = request.renames ?? []
+  const existingByName = new Map(existingEntries.map(entry => [entry.name, entry]))
+  const finalNames = new Set(request.entries.map(entry => entry.name))
+  const renameByOriginal = new Map(renames.map(rename => [rename.originalName, rename.newName]))
+  const renameByNew = new Map(renames.map(rename => [rename.newName, rename.originalName]))
+
+  for (const rename of renames) {
+    if (!existingByName.has(rename.originalName)) {
+      throw new Error('CHARACTER_ROSTER_RENAME_SOURCE_MISSING')
+    }
+    if (!finalNames.has(rename.newName)) {
+      throw new Error('CHARACTER_ROSTER_RENAME_MISMATCH')
+    }
+  }
+
+  const entries = request.entries.map((candidate) => {
+    const originalName = renameByNew.get(candidate.name) ?? candidate.name
+    const existing = existingByName.get(originalName)
+    const mapped = mapManualRelationshipTargets(candidate, renameByOriginal, finalNames)
+    const withLegacyNotes = existing?.legacyRelationshipNotes && !mapped.legacyRelationshipNotes
+      ? { ...mapped, legacyRelationshipNotes: existing.legacyRelationshipNotes }
+      : mapped
+    if (!withLegacyNotes.currentState) return withLegacyNotes
+    const provenance = { ...withLegacyNotes.currentState.provenance }
+    for (const field of CHARACTER_STATE_TEXT_FIELDS) {
+      if ((existing?.currentState?.[field] ?? '') !== withLegacyNotes.currentState[field]) {
+        provenance[field] = {
+          kind: 'author',
+          chapterNumber: withLegacyNotes.currentState.updatedAtChapter,
+        }
+      } else if (existing?.currentState?.provenance?.[field]) {
+        provenance[field] = existing.currentState.provenance[field]
+      }
+    }
+    return {
+      ...withLegacyNotes,
+      currentState: { ...withLegacyNotes.currentState, provenance },
+    }
+  })
+  assertRelationshipClosure(entries)
+  return { entries, renameByOriginal }
+}
+
+function updateBlueprintReferencesForManualEdit(
+  db: BetterSqlite3.Database,
+  renameByOriginal: ReadonlyMap<string, string>,
+  finalNames: ReadonlySet<string>,
+): void {
+  const blueprints = db.prepare('SELECT chapter_number, characters FROM blueprints').all() as Array<{
+    chapter_number: number
+    characters: string
+  }>
+  const updateBlueprint = db.prepare(`
+    UPDATE blueprints
+    SET characters = ?, updated_at = datetime('now')
+    WHERE chapter_number = ?
+  `)
+  for (const blueprint of blueprints) {
+    let rawNames: unknown
+    try {
+      rawNames = JSON.parse(blueprint.characters)
+    } catch {
+      throw new Error('CHARACTER_ROSTER_BLUEPRINT_CHARACTERS_INVALID')
+    }
+    if (!Array.isArray(rawNames) || !rawNames.every(name => typeof name === 'string')) {
+      throw new Error('CHARACTER_ROSTER_BLUEPRINT_CHARACTERS_INVALID')
+    }
+    const nextNames = rawNames
+      .map(name => renameByOriginal.get(name) ?? name)
+      .filter(name => finalNames.has(name))
+      .filter((name, index, values) => values.indexOf(name) === index)
+    if (JSON.stringify(nextNames) !== JSON.stringify(rawNames)) {
+      updateBlueprint.run(JSON.stringify(nextNames), blueprint.chapter_number)
+    }
+  }
+}
+
+function fullFactHash(entries: CharacterRosterEntry[]): string {
+  return hashText(JSON.stringify(canonicalEntries(entries)))
+}
+
+/**
+ * 公开事实哈希。身份 schema 项目从带稳定 ID 的事实派生，因此角色改名、
+ * 同名目标重指向都会改变它；旧项目保持 meta.fact_hash 的姓名版本不变。
+ */
+function fullIdentityFactHash(entries: CharacterRosterEntry[]): string {
+  return hashText(JSON.stringify(canonicalIdentityEntries(entries)))
+}
+
+function sortedEntries(entries: CharacterRosterEntry[]): CharacterRosterEntry[] {
+  return [...entries].sort((left, right) => (
+    ROLE_ORDER[left.role] - ROLE_ORDER[right.role] || compareText(left.name, right.name)
+  ))
+}
+
+/**
+ * 只从结构化角色名单生成展示 Markdown。此函数绝不读取或解释旧 Markdown。
+ */
+export function renderCharacterRosterMarkdown(
+  entries: CharacterRosterEntry[],
+  writingLanguage: WritingLanguage = DEFAULT_WRITING_LANGUAGE,
+): string {
+  const canonical = sortedEntries(entries)
+  if (canonical.length === 0) return ''
+  const english = writingLanguage === 'en-US'
+
+  const blocks = canonical.map(entry => {
+    const roleLabel = english
+      ? CHARACTER_ROLE_LABELS[entry.role].enUS
+      : CHARACTER_ROLE_LABELS[entry.role].zhCN
+    const lines = [`## ${roleLabel}${english ? ': ' : '：'}${entry.name}`]
+    const fields: Array<[string, string]> = [
+      [english ? 'Gender' : '性别', entry.gender],
+      [english ? 'Age' : '年龄', entry.age],
+      [english ? 'Appearance' : '外貌', entry.appearance],
+      [english ? 'Personality' : '性格', entry.personality],
+      [english ? 'Background' : '背景', entry.background],
+      [english ? 'Abilities' : '能力', entry.abilities],
+      [english ? 'Motivation' : '动机', entry.motivation],
+      [english ? 'Arc' : '弧光', entry.arc],
+      [english ? 'Notes' : '备注', entry.notes],
+    ]
+    for (const [label, value] of fields) {
+      if (value) lines.push(`- ${label}${english ? ': ' : '：'}${value}`)
+    }
+    for (const relationship of entry.relationships) {
+      lines.push(english
+        ? `- Relationship: ${relationship.target} (${relationship.relation})`
+        : `- 关系：${relationship.target}（${relationship.relation}）`)
+    }
+    if (entry.legacyRelationshipNotes) {
+      lines.push(english
+        ? `- Relationship notes: ${entry.legacyRelationshipNotes}`
+        : `- 关系备注：${entry.legacyRelationshipNotes}`)
+    }
+    return lines.join('\n')
+  })
+  return [english ? '# Character graph' : '# 角色图谱', ...blocks].join('\n\n')
+}
+
+function readMeta(db: BetterSqlite3.Database): CharacterRosterMetaRow {
+  const row = db.prepare(`
+    SELECT schema_version, revision, migration_state, legacy_markdown, projection_hash, fact_hash
+    FROM character_roster_meta
+    WHERE id = 'main'
+  `).get() as CharacterRosterMetaRow | undefined
+  if (!row) throw new Error('CHARACTER_ROSTER_META_MISSING')
+  return row
+}
+
+function readCurrentProjection(db: BetterSqlite3.Database): string {
+  return (db.prepare(
+    "SELECT COALESCE(characters_arch, '') AS characters_arch FROM project_core WHERE id = 'main'",
+  ).get() as { characters_arch?: string } | undefined)?.characters_arch ?? ''
+}
+
+/**
+ * 严格区分“可安全使用的既有角色卡”和“需要作者显式修复的旧 Markdown”。
+ * 所有自动打开/读取路径只做分类，绝不在这里写入或解析旧文本。
+ */
+function deriveRosterStatus(
+  meta: CharacterRosterMetaRow,
+  entries: readonly CharacterRosterEntry[],
+  renderedMarkdown: string,
+  currentProjection: string,
+): CharacterRosterStatus {
+  switch (meta.migration_state) {
+    case 'empty':
+      return entries.length === 0 && !meta.legacy_markdown.trim() && !currentProjection.trim()
+        ? 'empty'
+        : 'inconsistent'
+    case 'legacy_cards_preserved':
+      // 已有角色卡本身是受保护的结构化事实，但旧项目还未用这些事实重建
+      // 确定性只读图谱。不能在打开项目时自动写入，也不能直接标记 ready。
+      return 'inconsistent'
+    case 'legacy_markdown_pending':
+      return entries.length === 0 && !!meta.legacy_markdown.trim()
+        ? 'legacy_repair_required'
+        : 'inconsistent'
+    case 'ready':
+      // #83 起，read/commit 是唯一写入 seam。投影和包含 currentState 的
+      // 完整事实哈希都必须与表内事实一致，才能让 UI/工作流继续写入。
+      if (
+        meta.projection_hash !== hashText(renderedMarkdown)
+        || meta.fact_hash !== fullFactHash([...entries])
+        || currentProjection !== renderedMarkdown
+      ) return 'inconsistent'
+      return entries.length > 0 ? 'ready' : 'empty'
+  }
+}
+
+function identityProjectionEntries(db: BetterSqlite3.Database, includeIds = false): CharacterRosterEntry[] {
+  const relationships = db.prepare(`SELECT r.source_character_id,r.target_character_id,c.name,r.relation FROM character_relationships r
+    JOIN characters c ON c.character_id=r.target_character_id WHERE c.retired=0 ORDER BY r.relationship_id`).all() as { source_character_id: string; target_character_id: string; name: string; relation: string }[]
+  const activeIds = new Set((db.prepare('SELECT character_id FROM characters WHERE retired=0').all() as { character_id: string }[]).map(row => row.character_id))
+  return sortedEntries(CharacterRepository.getAll(db).filter(character => activeIds.has(character.characterId!)).map(character => ({ ...entryFromCharacter(character),
+    ...(includeIds ? { characterId: character.characterId } : {}),
+    relationships: relationships.filter(item => item.source_character_id === character.characterId).map(item => ({ target: item.name, relation: item.relation,
+      ...(includeIds ? { targetCharacterId: item.target_character_id } : {}) })) })))
+}
+/** 清空故事架构时丢弃升级遗留的角色架构原文，再按当前 ID 事实重建投影。 */
+export function clearLegacyCharacterArchitecture(db: BetterSqlite3.Database): void {
+  if (!db.inTransaction) throw new Error('CHARACTER_ID_TRANSACTION_REQUIRED')
+  db.prepare("UPDATE character_roster_meta SET legacy_markdown='' WHERE id='main'").run()
+  refreshCharacterIdentityProjection(db)
+}
+/** Compatibility prose is derived from ID facts and never acts as an identity write source. */
+export function refreshCharacterIdentityProjection(db: BetterSqlite3.Database): void {
+  if (!db.inTransaction || !hasCharacterIdentitySchema(db)) throw new Error('CHARACTER_ID_TRANSACTION_REQUIRED')
+  const entries = identityProjectionEntries(db), writingLanguage = db.prepare("SELECT writing_language FROM project_core WHERE id='main'").pluck().get() === 'en-US' ? 'en-US' : DEFAULT_WRITING_LANGUAGE
+  const projection = renderCharacterRosterMarkdown(entries, writingLanguage)
+  db.prepare("UPDATE project_core SET characters_arch=? WHERE id='main'").run(projection)
+  db.prepare("UPDATE character_roster_meta SET revision=revision+1,migration_state='ready',projection_hash=?,fact_hash=?,updated_at=datetime('now') WHERE id='main'").run(hashText(projection), fullFactHash(entries))
+}
+/** Dynamic state refreshes invalidate readers without rewriting author/static compatibility prose. */
+export function refreshCharacterStateProjection(db: BetterSqlite3.Database): void {
+  if (!db.inTransaction || !hasCharacterIdentitySchema(db)) throw new Error('CHARACTER_ID_TRANSACTION_REQUIRED')
+  db.prepare("UPDATE character_roster_meta SET revision=revision+1,fact_hash=?,updated_at=datetime('now') WHERE id='main'")
+    .run(fullFactHash(identityProjectionEntries(db)))
+}
+function readSnapshot(db: BetterSqlite3.Database): CharacterRosterSnapshot {
+  const meta = readMeta(db)
+  const hasIdentitySchema = hasCharacterIdentitySchema(db)
+  const entries = hasIdentitySchema ? identityProjectionEntries(db) : sortedEntries(CharacterRepository.getAll(db).map(entryFromCharacter))
+  // 身份 schema 项目额外读取带稳定 ID 的事实，用于公开 DTO 与公开事实哈希。
+  // 持久化 meta.fact_hash 仍是姓名版本，read/commit 的 ready 校验不受影响。
+  const identityEntries = hasIdentitySchema ? identityProjectionEntries(db, true) : entries
+  const writingLanguage = ProjectCoreRepository.get(db)?.writingLanguage ?? DEFAULT_WRITING_LANGUAGE
+  const currentProjection = readCurrentProjection(db)
+  const localizedProjection = renderCharacterRosterMarkdown(entries, writingLanguage)
+  const previousLanguageProjection = renderCharacterRosterMarkdown(
+    entries,
+    writingLanguage === 'en-US' ? 'zh-CN' : 'en-US',
+  )
+  // A project may change writing language after a ready roster was committed.
+  // Keep that exact historical projection readable; the next roster commit
+  // rewrites it in the current project language without changing facts.
+  const renderedMarkdown = (
+    meta.migration_state === 'ready'
+    && currentProjection === previousLanguageProjection
+    && meta.projection_hash === hashText(previousLanguageProjection)
+  ) ? previousLanguageProjection : localizedProjection
+  const projectionHash = hashText(renderedMarkdown)
+  return {
+    schemaVersion: CHARACTER_ROSTER_SCHEMA_VERSION,
+    revision: meta.revision,
+    migrationState: meta.migration_state,
+    status: deriveRosterStatus(meta, entries, renderedMarkdown, currentProjection),
+    entries: identityEntries,
+    ...(hasIdentitySchema ? {
+      identityRevision: db.prepare("SELECT revision FROM character_identity_meta WHERE id='main'").pluck().get() as number,
+      aliases: db.prepare(`SELECT a.character_id AS characterId,a.name,a.source_key AS sourceKey,
+        a.valid_from AS validFrom,a.valid_through AS validThrough FROM character_aliases a
+        JOIN characters c ON c.character_id=a.character_id WHERE c.retired=0
+        ORDER BY a.character_id,a.name,a.source_key,a.valid_from`).all() as NonNullable<CharacterRosterSnapshot['aliases']>,
+    } : {}),
+    renderedMarkdown,
+    projectionHash,
+    // 旧项目沿用持久化的姓名版本哈希；身份 schema 项目改为按稳定 ID 派生。
+    factHash: hasIdentitySchema ? fullIdentityFactHash(identityEntries) : meta.fact_hash,
+    // 该值始终是持久化的姓名版本哈希，供按姓名写入的历史收据做兼容校验。
+    nameOnlyFactHash: meta.fact_hash,
+    ...(meta.legacy_markdown ? { legacyMarkdown: meta.legacy_markdown } : {}),
+  }
+}
+
+function assertReadBack(
+  db: BetterSqlite3.Database,
+  expectedRevision: number,
+  expectedEntries: CharacterRosterEntry[],
+  expectedProjection: string,
+  expectedProjectionHash: string,
+  expectedFactHash: string,
+): CharacterRosterSnapshot {
+  const snapshot = readSnapshot(db)
+  const expectedStatus: CharacterRosterStatus = expectedEntries.length > 0 ? 'ready' : 'empty'
+  if (
+    snapshot.revision !== expectedRevision
+    || snapshot.migrationState !== 'ready'
+    || snapshot.status !== expectedStatus
+    || snapshot.projectionHash !== expectedProjectionHash
+    || snapshot.factHash !== expectedFactHash
+    || snapshot.renderedMarkdown !== expectedProjection
+    || JSON.stringify(canonicalEntries(snapshot.entries)) !== JSON.stringify(canonicalEntries(expectedEntries))
+  ) {
+    throw new Error('CHARACTER_ROSTER_READ_BACK_FAILED')
+  }
+  const core = db.prepare(
+    "SELECT characters_arch FROM project_core WHERE id = 'main'",
+  ).get() as { characters_arch?: string } | undefined
+  if (core?.characters_arch !== expectedProjection) {
+    throw new Error('CHARACTER_ROSTER_READ_BACK_FAILED')
+  }
+  return snapshot
+}
+
+/**
+ * 结构化角色名单的深 module。
+ *
+ * 外部 interface 只有 read/commit；校验、投影、幂等、事务与回读验证都留在
+ * implementation 内。当前旧角色写入路径仍可兼容，后续 ticket 再统一收口。
+ */
+export class CharacterRosterRepository {
+  static read(db = requiredDb()): CharacterRosterSnapshot {
+    ensureCharacterRosterSchema(db)
+    return readSnapshot(db)
+  }
+
+  static commit(candidate: CharacterRosterCommitRequest, assertGenerationSources?: () => void): CharacterRosterCommitReceipt {
+    const db = requiredDb()
+    ensureCharacterRosterSchema(db)
+    if (hasCharacterIdentitySchema(db)) throw new Error('CHARACTER_ID_WRITE_REQUIRED')
+    const request = normalizeRequest(candidate)
+    const requestPayloadHash = payloadHash(request)
+
+    return db.transaction(() => {
+      const existingOperation = db.prepare(`
+        SELECT operation_id, payload_hash, committed_revision, projection_hash
+        FROM character_roster_operations
+        WHERE operation_id = ?
+      `).get(request.operationId) as CharacterRosterOperationRow | undefined
+      if (existingOperation) {
+        if (existingOperation.payload_hash !== requestPayloadHash) {
+          throw new Error('CHARACTER_ROSTER_OPERATION_CONFLICT')
+        }
+        // 幂等 replay 只是“该操作已被观察到”的无写入查询，不能把历史
+        // committed_revision 冒充为当前事实。返回读取时的完整当前快照，保证
+        // receipt.revision 始终与 receipt.snapshot.revision 一致，也不会暗示
+        // 较早 payload 在后续提交后又重新生效。
+        const snapshot = readSnapshot(db)
+        return {
+          operationId: request.operationId,
+          payloadHash: requestPayloadHash,
+          revision: snapshot.revision,
+          idempotent: true,
+          snapshot,
+        }
+      }
+
+      assertGenerationSources?.()
+      const meta = readMeta(db)
+      if (request.expectedRevision !== meta.revision) {
+        throw new Error('CHARACTER_ROSTER_REVISION_STALE')
+      }
+      const existingEntries = CharacterRepository.getAll().map(entryFromCharacter)
+      const currentSnapshot = readSnapshot(db)
+      const intent = request.intent ?? 'initialize'
+      const maySafelyRegenerate = intent === 'architecture_generation'
+      const isLegacyRepair = intent === 'legacy_repair'
+      const isLegacyCardsAdoption = intent === 'legacy_cards_adoption'
+      const isManualEdit = isManualEditIntent(intent)
+      const isIncremental = intent === 'blueprint_sync' || intent === 'chapter_progress'
+      const isNovelImport = intent === 'novel_import'
+      if (currentSnapshot.status === 'legacy_repair_required' && !isLegacyRepair) {
+        throw new Error('CHARACTER_ROSTER_LEGACY_REPAIR_REQUIRED')
+      }
+      if (currentSnapshot.status === 'inconsistent' && !isLegacyCardsAdoption) {
+        if (meta.migration_state === 'legacy_cards_preserved') {
+          throw new Error('CHARACTER_ROSTER_EXISTING_PROTECTED')
+        }
+        throw new Error('CHARACTER_ROSTER_STATE_INCONSISTENT')
+      }
+      if (isLegacyRepair) {
+        if (currentSnapshot.status !== 'legacy_repair_required' || existingEntries.length > 0) {
+          throw new Error('CHARACTER_ROSTER_LEGACY_REPAIR_NOT_NEEDED')
+        }
+        if (request.expectedLegacyMarkdown !== meta.legacy_markdown) {
+          throw new Error('CHARACTER_ROSTER_LEGACY_SOURCE_CHANGED')
+        }
+      } else if (isLegacyCardsAdoption) {
+        if (meta.migration_state !== 'legacy_cards_preserved' || existingEntries.length === 0) {
+          throw new Error('CHARACTER_ROSTER_LEGACY_ADOPTION_UNAVAILABLE')
+        }
+        if (request.expectedLegacyMarkdown !== meta.legacy_markdown) {
+          throw new Error('CHARACTER_ROSTER_LEGACY_SOURCE_CHANGED')
+        }
+        const candidateNames = new Set(request.entries.map(entry => entry.name))
+        const existingNames = new Set(existingEntries.map(entry => entry.name))
+        if (
+          candidateNames.size !== existingNames.size
+          || [...candidateNames].some(name => !existingNames.has(name))
+        ) {
+          throw new Error('CHARACTER_ROSTER_LEGACY_SOURCE_CHANGED')
+        }
+      } else if (
+        !maySafelyRegenerate
+        && !isManualEdit
+        && !isIncremental
+        && !isNovelImport
+        && (meta.migration_state !== 'empty' || existingEntries.length > 0)
+      ) {
+        throw new Error('CHARACTER_ROSTER_EXISTING_PROTECTED')
+      }
+
+      let renameByOriginal = new Map<string, string>()
+      const committedEntries = isLegacyCardsAdoption
+        ? existingEntries
+        : isManualEdit
+          ? (() => {
+              const resolved = resolveManualEntries(request, existingEntries)
+              renameByOriginal = resolved.renameByOriginal
+              return resolved.entries
+            })()
+          : maySafelyRegenerate || isNovelImport
+            ? mergeGeneratedEntriesWithExisting(request.entries, existingEntries)
+            : isIncremental
+                ? mergeIncrementalEntriesWithExisting(
+                  db,
+                  request.entries,
+                  existingEntries,
+                   intent as Extract<CharacterRosterCommitIntent, 'blueprint_sync' | 'chapter_progress'>,
+                   request.source,
+                 )
+              : request.entries
+      const writingLanguage = ProjectCoreRepository.get()?.writingLanguage ?? DEFAULT_WRITING_LANGUAGE
+      const projection = renderCharacterRosterMarkdown(committedEntries, writingLanguage)
+      const projectionHash = hashText(projection)
+      const factHash = fullFactHash(committedEntries)
+      const nextRevision = meta.revision + 1
+
+      // adoption 的唯一职责是以已有结构化卡片重建只读投影。它不能重写
+      // cards 表，否则“采用已有卡片”会变成一次隐式数据迁移。
+      if (isManualEdit) {
+        // 手工保存提交的是完整名单快照。先清空再回填使删除、改名（包括交换）
+        // 与资料变更受同一事务保护；transaction 回滚时不会留下半个名单。
+        db.prepare('DELETE FROM characters').run()
+        for (const entry of committedEntries) {
+          CharacterRepository.upsert(characterFromEntry(entry))
+        }
+        updateBlueprintReferencesForManualEdit(
+          db,
+          renameByOriginal,
+          new Set(committedEntries.map(entry => entry.name)),
+        )
+      } else if (!isLegacyCardsAdoption) {
+        for (const entry of committedEntries) CharacterRepository.upsert(characterFromEntry(entry))
+      }
+      const coreUpdate = db.prepare(`
+        UPDATE project_core
+        SET characters_arch = ?
+        WHERE id = 'main'
+      `).run(projection)
+      if (coreUpdate.changes !== 1) throw new Error('CHARACTER_ROSTER_PROJECT_CORE_MISSING')
+
+      db.prepare(`
+        UPDATE character_roster_meta
+        SET revision = ?, migration_state = 'ready', projection_hash = ?, fact_hash = ?, updated_at = datetime('now')
+        WHERE id = 'main'
+      `).run(nextRevision, projectionHash, factHash)
+      db.prepare(`
+        INSERT INTO character_roster_operations (
+          operation_id, payload_hash, committed_revision, projection_hash
+        ) VALUES (?, ?, ?, ?)
+      `).run(request.operationId, requestPayloadHash, nextRevision, projectionHash)
+
+      const snapshot = assertReadBack(
+        db,
+        nextRevision,
+        committedEntries,
+        projection,
+        projectionHash,
+        factHash,
+      )
+      return {
+        operationId: request.operationId,
+        payloadHash: requestPayloadHash,
+        revision: nextRevision,
+        idempotent: false,
+        snapshot,
+      }
+    }).immediate()
+  }
+}
+
+export interface CharacterIdentityChange {
+  characterId: string
+  /** Static edits leave all cs_* dynamic provenance untouched. */
+  fields: Partial<Pick<CharacterData, 'name' | 'role' | 'gender' | 'age' | 'appearance' | 'personality' | 'background' | 'abilities' | 'motivation' | 'arc' | 'notes'>>
+}
+export interface CharacterIdentityCommitRequest {
+  approval: import('../../src/shared/character-identity').CharacterApproval
+  changes: CharacterIdentityChange[]
+  creations: { selectionKey: string; fields: CharacterIdentityChange['fields'] & { name: string } }[]
+  retireIds: string[]
+  relationships: { sourceCharacterId?: string; sourceSelectionKey?: string; targetCharacterId?: string; targetSelectionKey?: string; relation: string }[]
+  resolutions: { proposalId: string; characterId: string }[]
+}
+export interface CharacterIdentityCommitReceipt {
+  approval: import('../../src/shared/character-identity').CharacterApproval
+  operationId: string
+  revision: number
+  created: { selectionKey: string; characterId: string }[]
+  idempotent: boolean
+}
+/** Only the main approval boundary supplies authorize. Legacy name-only commits never reach this API. */
+export function commitCharacterIdentities(
+  db: BetterSqlite3.Database,
+  request: CharacterIdentityCommitRequest,
+  authorize: (request: CharacterIdentityCommitRequest) => boolean = () => false,
+): CharacterIdentityCommitReceipt {
+  if (!hasCharacterIdentitySchema(db)) throw new Error('CHARACTER_ID_SCHEMA_REQUIRED')
+  const encoded = JSON.stringify(request), digest = createHash('sha256').update(encoded).digest('hex')
+  return db.transaction(() => {
+    if (!authorize(request)) throw new Error('CHARACTER_APPROVAL_REQUIRED')
+    if (JSON.stringify(request) !== encoded) throw new Error('CHARACTER_APPROVAL_MUTATED')
+    const previous = db.prepare('SELECT payload_hash,receipt_json FROM character_identity_approvals WHERE operation_id=?').get(request.approval.operationId) as { payload_hash: string; receipt_json: string } | undefined
+    if (previous) {
+      if (previous.payload_hash !== digest) throw new Error('CHARACTER_APPROVAL_NONCE_CONFLICT')
+      return { ...JSON.parse(previous.receipt_json), idempotent: true } as CharacterIdentityCommitReceipt
+    }
+    const current = (db.prepare("SELECT revision FROM character_identity_meta WHERE id='main'").get() as { revision: number }).revision
+    if (current !== request.approval.expectedRevision) throw new Error('CHARACTER_ID_REVISION_CONFLICT')
+    if (!request.approval.operationId || !request.approval.source || !['author-edit', 'adopt-generated', 'adopt-import', 'confirm-identity'].includes(request.approval.action)) throw new Error('CHARACTER_APPROVAL_INVALID')
+    const allowedSources = {
+      'author-edit': ['author'],
+      'adopt-generated': ['generated'],
+      'adopt-import': ['generated', 'derived'],
+      'confirm-identity': ['author'],
+    } as const
+    if (request.approval.source.kind === 'legacy'
+      || !(allowedSources[request.approval.action] as readonly string[]).includes(request.approval.source.kind)) throw new Error('CHARACTER_PROVENANCE_INVALID')
+    const provenance = request.approval.source
+    const ref = provenance.source
+    if (!ref || typeof ref.projectId !== 'string' || !ref.projectId.trim() || typeof ref.epoch !== 'string' || !ref.epoch.trim() || typeof ref.sourceId !== 'string' || !ref.sourceId.trim() || !Number.isSafeInteger(ref.revision) || ref.revision < 0 || !isContentHash(ref.contentHash)
+      || (provenance.kind === 'generated' || provenance.kind === 'derived') && !isContentHash(provenance.modelRevision)) throw new Error('CHARACTER_PROVENANCE_INVALID')
+    const revision = current + 1
+    const attributedSource = { ...request.approval.source, approvalId: request.approval.operationId }
+    const source = JSON.stringify(attributedSource)
+    if (request.resolutions.length && request.approval.action !== 'confirm-identity') throw new Error('CHARACTER_ID_CONFIRMATION_REQUIRED')
+    const created: CharacterIdentityCommitReceipt['created'] = []
+    const allowed = new Set(['name', 'role', 'gender', 'age', 'appearance', 'personality', 'background', 'abilities', 'motivation', 'arc', 'notes'])
+    const validateFields = (fields: CharacterIdentityChange['fields']) => {
+      for (const [key, value] of Object.entries(fields)) if (!allowed.has(key) || typeof value !== 'string' || key === 'name' && !value.trim()) throw new Error('CHARACTER_FIELDS_INVALID')
+    }
+    const unique = (ids: string[]) => { if (ids.some(id => !id) || new Set(ids).size !== ids.length) throw new Error('CHARACTER_ID_DUPLICATE') }
+    unique(request.changes.map(change => change.characterId)); unique(request.creations.map(creation => creation.selectionKey)); unique(request.retireIds)
+    if (request.retireIds.some(id => request.changes.some(change => change.characterId === id))) throw new Error('CHARACTER_ID_CONFLICT')
+    const active = (id: string) => {
+      const row = db.prepare('SELECT * FROM characters WHERE character_id=? AND retired=0').get(id) as Record<string, unknown> | undefined
+      if (!row) throw new Error('CHARACTER_ID_UNKNOWN')
+      return row
+    }
+    for (const creation of request.creations) {
+      validateFields(creation.fields)
+      if (typeof creation.fields.name !== 'string' || !creation.fields.name.trim()) throw new Error('CHARACTER_FIELDS_INVALID')
+      const id = randomUUIDForIdentity(), keys = Object.keys(creation.fields)
+      db.prepare(`INSERT INTO characters(character_id,static_provenance,identity_revision,${keys.join(',')}) VALUES(?,?,?,${keys.map(() => '?').join(',')})`).run(id, source, revision, ...Object.values(creation.fields))
+      db.prepare('INSERT INTO character_aliases VALUES(?,?,?,?,NULL)').run(id, creation.fields.name, request.approval.operationId, revision)
+      created.push({ selectionKey: creation.selectionKey, characterId: id })
+    }
+    for (const change of request.changes) {
+      const row = active(change.characterId); validateFields(change.fields)
+      const keys = Object.keys(change.fields)
+      if (keys.length) {
+        // Field provenance is merged so adopting generated text never relabels untouched author fields.
+        const prior = JSON.parse(row.static_provenance as string) as Record<string, unknown>
+        const provenance = { ...prior, fields: { ...(prior.fields as Record<string, unknown> | undefined), ...Object.fromEntries(keys.map(key => [key, attributedSource])) } }
+        db.prepare(`UPDATE characters SET ${keys.map(key => `${key}=?`).join(',')},static_provenance=?,identity_revision=? WHERE character_id=?`).run(...Object.values(change.fields), JSON.stringify(provenance), revision, change.characterId)
+      }
+      if (change.fields.name !== undefined && change.fields.name !== row.name) {
+        db.prepare('UPDATE character_aliases SET valid_through=? WHERE character_id=? AND valid_through IS NULL').run(current, change.characterId)
+        db.prepare('INSERT INTO character_aliases VALUES(?,?,?,?,NULL)').run(change.characterId, change.fields.name, request.approval.operationId, revision)
+      }
+    }
+    for (const id of request.retireIds) { active(id); db.prepare('UPDATE characters SET retired=1,identity_revision=? WHERE character_id=?').run(revision, id); db.prepare('UPDATE character_aliases SET valid_through=? WHERE character_id=? AND valid_through IS NULL').run(current, id) }
+    const receipt: CharacterIdentityCommitReceipt = { approval: structuredClone(request.approval), operationId: request.approval.operationId, revision, created, idempotent: false }
+    db.prepare('INSERT INTO character_identity_approvals VALUES(?,?,?)').run(request.approval.operationId, digest, JSON.stringify(receipt))
+    const endpoint = (id: string | undefined, selectionKey: string | undefined) => {
+      if (Boolean(id) === Boolean(selectionKey)) throw new Error('CHARACTER_RELATIONSHIP_ID_REQUIRED')
+      const resolved = id ?? created.find(item => item.selectionKey === selectionKey)?.characterId
+      if (!resolved) throw new Error('CHARACTER_RELATIONSHIP_ID_REQUIRED')
+      return resolved
+    }
+    const relationKeys = new Set<string>()
+    for (const relationship of request.relationships) {
+      const fromId = endpoint(relationship.sourceCharacterId, relationship.sourceSelectionKey), toId = endpoint(relationship.targetCharacterId, relationship.targetSelectionKey)
+      const from = active(fromId), to = active(toId), relationKey = JSON.stringify([fromId,toId,relationship.relation])
+      if (!relationship.relation.trim() || fromId === toId || relationKeys.has(relationKey)) throw new Error('CHARACTER_RELATIONSHIP_INVALID')
+      relationKeys.add(relationKey)
+      db.prepare('INSERT INTO character_relationships VALUES(?,?,?,?,?,?,?,?)').run(randomUUIDForIdentity(), fromId, toId, relationship.relation, from.name, to.name, source, request.approval.operationId)
+    }
+    for (const resolution of request.resolutions) {
+      active(resolution.characterId)
+      const proposal = db.prepare('SELECT resolved_character_id,owner_character_id,raw_value,source_key FROM character_identity_proposals WHERE proposal_id=?').get(resolution.proposalId) as { resolved_character_id: string | null; owner_character_id: string | null; raw_value: string; source_key: string } | undefined
+      if (!proposal || proposal.resolved_character_id) throw new Error('CHARACTER_PROPOSAL_CONFLICT')
+      // Generic legacy resolution cannot mutate immutable finalization snapshots or versioned proposal envelopes.
+      if (!/^legacy:(?:characters:\d+:relationships:\d+|blueprints:\d+:characters:\d+)$/u.test(proposal.source_key))
+        throw new Error('CHARACTER_PROPOSAL_KIND_INVALID')
+      db.prepare('UPDATE character_identity_proposals SET resolved_character_id=?,approval_id=? WHERE proposal_id=?').run(resolution.characterId, request.approval.operationId, resolution.proposalId)
+      if (proposal.owner_character_id) {
+        let parsed: unknown
+        try { parsed = JSON.parse(proposal.raw_value) } catch { parsed = null }
+        if (parsed && typeof parsed === 'object' && 'relation' in parsed && typeof parsed.relation === 'string' && parsed.relation.trim()) {
+          const from = active(proposal.owner_character_id), to = active(resolution.characterId)
+          if (proposal.owner_character_id === resolution.characterId) throw new Error('CHARACTER_RELATIONSHIP_INVALID')
+          db.prepare('INSERT INTO character_relationships VALUES(?,?,?,?,?,?,?,?)').run(randomUUIDForIdentity(), proposal.owner_character_id, resolution.characterId, parsed.relation, from.name, to.name, source, request.approval.operationId)
+        }
+      }
+    }
+    db.prepare("UPDATE character_identity_meta SET revision=? WHERE id='main'").run(revision)
+    return receipt
+  })()
+}
+
+export function readCharacterIdentitySnapshot(db: BetterSqlite3.Database) {
+  if (!hasCharacterIdentitySchema(db)) throw new Error('CHARACTER_ID_SCHEMA_REQUIRED')
+  return db.transaction(() => ({
+    revision: (db.prepare("SELECT revision FROM character_identity_meta WHERE id='main'").get() as { revision: number }).revision,
+    characters: db.prepare('SELECT * FROM characters ORDER BY character_id').all(),
+    aliases: db.prepare('SELECT * FROM character_aliases ORDER BY character_id,name,valid_from').all(),
+    relationships: db.prepare('SELECT * FROM character_relationships ORDER BY relationship_id').all(),
+    proposals: db.prepare('SELECT * FROM character_identity_proposals ORDER BY proposal_id').all(),
+  }))()
+}

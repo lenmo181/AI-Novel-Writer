@@ -1,0 +1,166 @@
+/* ================= 全局导航轨 ================= */
+.stage-rail {
+  width: 68px;
+  flex: none;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 8px 10px;
+  background: var(--frame);
+  border-right: 1px solid var(--rule);
+}
+
+.stage-rail-mark {
+  width: 36px;
+  height: 36px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--accent-line);
+  border-radius: 10px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease);
+}
+
+.stage-rail-mark span {
+  width: 18px;
+  height: 19px;
+  display: block;
+  background: currentColor;
+  mask: url("../../../assets/brand/pagekin-mark.svg") center / contain no-repeat;
+}
+
+.stage-rail-mark:hover {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-ink);
+  transform: translateY(-1px);
+}
+
+.stage-rail-primary,
+.stage-rail-footer {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+.stage-rail-footer {
+  margin-top: auto;
+}
+
+.stage-rail-item {
+  position: relative;
+  width: 52px;
+  min-height: 48px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 5px 3px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--ink-3);
+  font: 500 10px/1.2 var(--font-ui);
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+
+.stage-rail-item:hover {
+  border-color: var(--rule);
+  background: var(--sunken);
+  color: var(--ink);
+}
+
+.stage-rail-item[aria-current='page'] {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.stage-rail-item[aria-current='page']::before {
+  content: '';
+  position: absolute;
+  left: -9px;
+  width: 3px;
+  height: 22px;
+  border-radius: 0 3px 3px 0;
+  background: var(--accent);
+}
+
+/* 活动阶段的墨线有轻微呼吸，传达当前工作位置；它不改变布局也不抢焦点。 */
+.stage-rail-item[aria-current='page']::after {
+  content: '';
+  position: absolute;
+  inset: 6px;
+  border-radius: inherit;
+  box-shadow: 0 0 0 1px var(--accent-line);
+  opacity: .38;
+  pointer-events: none;
+  animation: stage-rail-pulse 2.8s var(--ease) infinite;
+}
+
+@keyframes stage-rail-pulse {
+  0%, 100% { opacity: .2; }
+  50% { opacity: .62; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stage-rail-item[aria-current='page']::after {
+    animation: none;
+    opacity: .38;
+  }
+}
+
+.stage-rail-version {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  color: var(--ink-4);
+  opacity: .72;
+}
+
+.stage-shell[data-library] .stage-rail {
+  padding-top: 16px;
+}
+
+@media (max-width: 960px) {
+  .stage-rail {
+    width: 60px;
+    padding-inline: 6px;
+  }
+
+  .stage-rail-item {
+    width: 48px;
+  }
+
+  .stage-rail-item[aria-current='page']::before {
+    left: -7px;
+  }
+}
+
+@media (max-width: 680px) {
+  .stage-rail {
+    width: 54px;
+    padding-inline: 4px;
+  }
+
+  .stage-rail-mark {
+    width: 32px;
+    height: 32px;
+  }
+
+  .stage-rail-item {
+    width: 46px;
+    min-height: 44px;
+    font-size: 9px;
+  }
+}

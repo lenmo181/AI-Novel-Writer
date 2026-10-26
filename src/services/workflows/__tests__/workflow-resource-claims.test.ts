@@ -1,0 +1,310 @@
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
+
+import { workflowResourceClaimsConflict } from '../../../shared/workflow-resource-claims'
+import type { ImportPurpose, ImportRunSnapshot } from '../../../shared/import-run'
+import { useProjectStore } from '../../../stores/project-store'
+import { useWorkflowStore } from '../../../stores/workflow-store'
+import {
+  createArchitectureWorkflow,
+  migrateLegacyCharacterRoster,
+} from '../architecture-workflow'
+import {
+  createChapterWorkflow,
+  createFinalizeWorkflow,
+} from '../chapter-workflow'
+import { createBatchChapterWorkflow } from '../batch-chapter-workflow'
+import { createDirectoryWorkflow } from '../directory-workflow'
+import { createImportWorkflow } from '../import-workflow'
+
+const PROJECT_PATH = 'C:\\novels\\workflow-resource-claims'
+const PROJECT_SESSION = Object.freeze({
+  projectId: 'workflow-resource-claims',
+  leaseId: 'lease-workflow-resource-claims',
+  projectPath: PROJECT_PATH,
+})
+
+function setCurrentProject(): void {
+  useProjectStore.setState({
+    currentProject: {
+      id: PROJECT_SESSION.projectId,
+      name: 'Workflow resource claims',
+      path: PROJECT_PATH,
+      sessionLease: PROJECT_SESSION.leaseId,
+      novelConfig: {
+        totalChapters: 3,
+        globalGuidance: '',
+        genre: 'mystery',
+      },
+    } as never,
+  })
+}
+
+function createFinalize(chapterNumber: number) {
+  return createFinalizeWorkflow({
+    projectPath: PROJECT_PATH,
+    chapterNumber,
+    chapterTitle: `Chapter ${chapterNumber}`,
+    draftPath: `ai-novel://draft/${chapterNumber}`,
+    draftContent: `Draft ${chapterNumber}`,
+  }, PROJECT_SESSION)
+}
+
+function createDraft(chapterNumber: number) {
+  return createChapterWorkflow({
+    projectPath: PROJECT_PATH,
+    chapterNumber,
+    title: `Chapter ${chapterNumber}`,
+    role: 'development',
+    purpose: 'advance the plot',
+    characters: [],
+    keyEvents: 'an event',
+  }, PROJECT_SESSION)
+}
+
+function createImportRun(purpose: ImportPurpose, totalChapters = 1): ImportRunSnapshot {
+  return {
+    id: `import-${purpose}`,
+    purpose,
+    rootRunId: `import-${purpose}`,
+    effectNamespace: `import:${purpose}:import-${purpose}`,
+    sourceDisplay: [{ displayName: 'novel.txt', mediaType: 'text/plain', size: 20 }],
+    locale: 'en-US',
+    stage: purpose === 'author-manuscript' ? 'author-commit' : 'knowledge',
+    status: 'running',
+    completedBatches: {},
+    lastError: '',
+    resumable: true,
+    cancelRequested: false,
+    totalChapters,
+    totalContentSize: 20,
+    manifestChapterCount: totalChapters,
+    manifestContentSize: 20,
+    manifestWordCount: 20,
+    completedChapters: 0,
+    createdAt: '2026-01-01',
+    updatedAt: '2026-01-01',
+    ...(purpose === 'author-manuscript'
+      ? { authorityFingerprint: 'a'.repeat(64), manifestFingerprint: 'b'.repeat(64) }
+      : {}),
+  }
+}
+
+function createImport(
+  purpose: ImportPurpose,
+  totalChapters = 1,
+  authorChapterNumbers?: readonly number[],
+) {
+  const params = {
+    projectPath: PROJECT_PATH,
+    projectSession: PROJECT_SESSION,
+    run: createImportRun(purpose, totalChapters),
+    executionOwner: 'resource-claim-test',
+    authorChapterNumbers,
+  }
+  return createImportWorkflow(params)
+}
+
+beforeEach(() => {
+  // 工作流夹具显式提供桌面桥接；未知调用仍拒绝，避免掩盖真实 IPC 缺失。
+  vi.stubGlobal('window', {
+    aiNovelAPI: {
+      invoke: vi.fn(async (channel: string, request: unknown) => {
+        if (channel === 'legacy-roster:read-source') return {
+          snapshot: { revision: 7, migrationState: 'legacy_cards_preserved' },
+          legacyHash: 'a'.repeat(64), identityRevision: 3, factsHash: 'b'.repeat(64),
+        }
+        if (channel === 'legacy-roster:adopt-existing') {
+          expect(request).toMatchObject({ expectedRevision: 7, expectedLegacyHash: 'a'.repeat(64), expectedIdentityRevision: 3, expectedFactsHash: 'b'.repeat(64) })
+          expect(useWorkflowStore.getState().activeRuns[0]?.resourceKeys).toContain('character-roster')
+          return { success: true, snapshot: { renderedMarkdown: '合成既有角色卡的只读图谱' } }
+        }
+        if (channel === 'skills:list-user') return []
+        if (channel === 'fs:check-exists') return false
+        throw new Error(`测试未配置桌面调用：${channel}`)
+      }),
+      on: vi.fn(() => () => {}),
+      once: vi.fn(),
+    },
+  })
+})
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+  useProjectStore.setState({ currentProject: null })
+  useWorkflowStore.setState({
+    activeRuns: [],
+    history: [],
+    globalLogs: [],
+    waitingRuns: {},
+    currentRun: null,
+    waitingForConfirm: false,
+    waitingAfterStepIndex: -1,
+  })
+})
+
+describe('workflow factory resource claims', () => {
+  it('serializes finalization against shared fact writers', () => {
+    setCurrentProject()
+    const firstFinalize = createFinalize(1)
+    const secondFinalize = createFinalize(2)
+    const directory = createDirectoryWorkflow(
+      { mode: 'full' },
+      PROJECT_PATH,
+      PROJECT_SESSION,
+    )
+
+    expect(firstFinalize.resourceKeys).toEqual(expect.arrayContaining([
+      'character-roster',
+      'continuity',
+      'chapter-summary',
+    ]))
+    expect(directory.resourceKeys).toContain('character-roster')
+    expect(workflowResourceClaimsConflict(firstFinalize, secondFinalize)).toBe(true)
+    expect(workflowResourceClaimsConflict(firstFinalize, directory)).toBe(true)
+  })
+
+  it('keeps different chapter drafts concurrent when neither writes shared facts', () => {
+    expect(workflowResourceClaimsConflict(createDraft(1), createDraft(2))).toBe(false)
+  })
+
+  it('claims shared facts only for batch workflows that auto-finalize', () => {
+    const autoFinalize = createBatchChapterWorkflow({
+      projectPath: PROJECT_PATH,
+      projectSession: PROJECT_SESSION,
+      startChapterNumber: 1,
+      chapterCount: 1,
+      generationModelId: 'test-model',
+      completionMode: 'auto_finalize',
+    })
+    const reviewDrafts = createBatchChapterWorkflow({
+      projectPath: PROJECT_PATH,
+      projectSession: PROJECT_SESSION,
+      startChapterNumber: 3,
+      chapterCount: 1,
+      generationModelId: 'test-model',
+      completionMode: 'draft_review',
+    })
+
+    expect(autoFinalize.resourceKeys).toEqual(expect.arrayContaining([
+      'character-roster',
+      'continuity',
+      'chapter-summary',
+    ]))
+    expect(reviewDrafts.resourceKeys).toEqual(['chapter:3'])
+    expect(workflowResourceClaimsConflict(autoFinalize, createFinalize(2))).toBe(true)
+    expect(workflowResourceClaimsConflict(reviewDrafts, createFinalize(2))).toBe(false)
+  })
+
+  it('serializes character architecture against other character roster writers', () => {
+    setCurrentProject()
+    const architecture = createArchitectureWorkflow({
+      projectPath: PROJECT_PATH,
+      projectSession: PROJECT_SESSION,
+      selectedSteps: ['characters'],
+    })
+    const finalize = createFinalize(1)
+    const directory = createDirectoryWorkflow(
+      { mode: 'full' },
+      PROJECT_PATH,
+      PROJECT_SESSION,
+    )
+
+    expect(architecture.resourceKeys).toContain('character-roster')
+    expect(workflowResourceClaimsConflict(architecture, finalize)).toBe(true)
+    expect(workflowResourceClaimsConflict(architecture, directory)).toBe(true)
+  })
+
+  it('does not claim the character roster when the character architecture step is omitted', () => {
+    setCurrentProject()
+    const premiseOnly = createArchitectureWorkflow({
+      projectPath: PROJECT_PATH,
+      projectSession: PROJECT_SESSION,
+      selectedSteps: ['premise'],
+    })
+
+    expect(premiseOnly.resourceKeys).toEqual(['architecture'])
+  })
+
+  it('serializes the explicit legacy roster repair against roster writers', async () => {
+    setCurrentProject()
+    await migrateLegacyCharacterRoster(PROJECT_PATH)
+
+    const repair = useWorkflowStore.getState().history.find(run => run.type === 'post_process')
+    expect(repair).toBeDefined()
+    expect(repair?.status).toBe('completed')
+    const channels = vi.mocked(window.aiNovelAPI!.invoke).mock.calls.map(([channel]) => channel)
+    expect(channels.filter(channel => channel === 'legacy-roster:read-source')).toHaveLength(2)
+    expect(channels.filter(channel => channel === 'legacy-roster:adopt-existing')).toHaveLength(1)
+    expect(channels).not.toContain('legacy-roster:begin')
+    expect(channels).not.toContain('db:character-roster-commit')
+    expect(repair?.resourceKeys ?? []).toContain('character-roster')
+    const architecture = createArchitectureWorkflow({
+      projectPath: PROJECT_PATH,
+      projectSession: PROJECT_SESSION,
+      selectedSteps: ['characters'],
+    })
+    const directory = createDirectoryWorkflow(
+      { mode: 'full' },
+      PROJECT_PATH,
+      PROJECT_SESSION,
+    )
+    expect(workflowResourceClaimsConflict(repair ?? {}, architecture)).toBe(true)
+    expect(workflowResourceClaimsConflict(repair ?? {}, createFinalize(1))).toBe(true)
+    expect(workflowResourceClaimsConflict(repair ?? {}, directory)).toBe(true)
+  })
+
+  it('serializes reference imports against every project-fact writer they overlap', () => {
+    setCurrentProject()
+    const referenceImport = createImport('reference')
+    const architecture = createArchitectureWorkflow({
+      projectPath: PROJECT_PATH,
+      projectSession: PROJECT_SESSION,
+      selectedSteps: ['characters'],
+    })
+    const directory = createDirectoryWorkflow(
+      { mode: 'full' },
+      PROJECT_PATH,
+      PROJECT_SESSION,
+    )
+
+    expect(referenceImport.resourceKeys).toEqual([
+      'novel-config',
+      'architecture',
+      'character-roster',
+      'blueprints',
+    ])
+    expect(workflowResourceClaimsConflict(referenceImport, createFinalize(1))).toBe(true)
+    expect(workflowResourceClaimsConflict(referenceImport, directory)).toBe(true)
+    expect(workflowResourceClaimsConflict(referenceImport, architecture)).toBe(true)
+  })
+
+  it('serializes author imports on finalized facts while preserving an unrelated draft', () => {
+    setCurrentProject()
+    const authorImport = createImport('author-manuscript', 2, [2, 7])
+    const architecture = createArchitectureWorkflow({
+      projectPath: PROJECT_PATH,
+      projectSession: PROJECT_SESSION,
+      selectedSteps: ['characters'],
+    })
+    const directory = createDirectoryWorkflow(
+      { mode: 'full' },
+      PROJECT_PATH,
+      PROJECT_SESSION,
+    )
+
+    expect(authorImport.resourceKeys).toEqual([
+      'chapter:2',
+      'chapter:7',
+      'character-roster',
+      'continuity',
+      'chapter-summary',
+    ])
+    expect(workflowResourceClaimsConflict(authorImport, createFinalize(3))).toBe(true)
+    expect(workflowResourceClaimsConflict(authorImport, directory)).toBe(true)
+    expect(workflowResourceClaimsConflict(authorImport, architecture)).toBe(true)
+    expect(workflowResourceClaimsConflict(authorImport, createDraft(7))).toBe(true)
+    expect(workflowResourceClaimsConflict(authorImport, createDraft(2))).toBe(true)
+    expect(workflowResourceClaimsConflict(authorImport, createDraft(1))).toBe(false)
+    expect(workflowResourceClaimsConflict(authorImport, createDraft(3))).toBe(false)
+  })
+})

@@ -1,0 +1,1320 @@
+import path from 'node:path'
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { appErrorMessage } from '../../../src/i18n/app-errors'
+
+type IpcHandler = (...args: unknown[]) => Promise<unknown>
+
+const mocks = vi.hoisted(() => ({
+  handlers: new Map<string, IpcHandler>(),
+  currentProjectPath: '',
+  existingPaths: new Set<string>(),
+  initCalls: [] as string[],
+  createCalls: [] as string[],
+  createdVelaDirectories: new Set<string>(),
+  failCorePaths: new Set<string>(),
+  failInitPaths: new Set<string>(),
+  onCoreGet: null as null | (() => void),
+  projectCoreGet: vi.fn(),
+  projectCoreInit: vi.fn(),
+  projectCoreUpdate: vi.fn(),
+  closeProjectDatabase: vi.fn(),
+  transaction: vi.fn((operation: () => void) => operation),
+  writeJsonFile: vi.fn(),
+  recentProjects: [] as Array<{ name: string; path: string; updatedAt: string; projectId?: string }>,
+  rmSync: vi.fn(),
+  removeDirectoryWithWindowsRetry: vi.fn(),
+  showMessageBox: vi.fn(),
+  importLegacyProjectCopy: vi.fn(),
+  resolveExactPath: vi.fn(),
+  resolveDirectoryPath: vi.fn(),
+  issueDirectory: vi.fn(),
+  probeProjectSqlite: vi.fn(),
+  revokeWebContents: vi.fn(),
+  showOpenDialog: vi.fn(),
+  projectAccess: {
+    createProject: vi.fn(),
+    probeExistingProject: vi.fn(),
+    adoptLegacyProject: vi.fn(),
+    beginSession: vi.fn(),
+    captureCurrentSession: vi.fn(),
+    sameCanonicalProjectRoot: vi.fn(),
+    assertCurrentSession: vi.fn(),
+    assertCurrentProjectContext: vi.fn(),
+    authorizeDeletion: vi.fn(),
+    invalidateCurrentSession: vi.fn(),
+  },
+  activeSession: null as null | {
+    kind: 'manifest'
+    projectId: string
+    rootPath: string
+    leaseId: string
+  },
+  leaseSequence: 0,
+  /** 作者在设置里保存过的界面语言；没保存时主进程按系统语言选。 */
+  storedLocale: undefined as undefined | 'zh-CN' | 'en-US',
+  systemLocale: 'zh-CN',
+  projectPeekService: {
+    issueCapability: vi.fn(),
+    revokeCapability: vi.fn(),
+    peek: vi.fn(),
+    readCurrent: vi.fn(),
+  },
+}))
+
+vi.mock('electron', () => ({
+  app: { getLocale: () => mocks.systemLocale },
+  dialog: {
+    showOpenDialog: mocks.showOpenDialog,
+    showMessageBox: mocks.showMessageBox,
+  },
+  ipcMain: {
+    handle: vi.fn((channel: string, handler: IpcHandler) => {
+      mocks.handlers.set(channel, handler)
+    }),
+  },
+}))
+
+vi.mock('node:fs', () => ({
+  default: {
+    existsSync: vi.fn((target: string) => mocks.existingPaths.has(path.resolve(target))),
+    mkdirSync: vi.fn(),
+    rmSync: mocks.rmSync,
+    statSync: vi.fn(() => ({ isDirectory: () => true })),
+    writeFileSync: vi.fn(),
+  },
+}))
+
+vi.mock('../../database', () => ({
+  closeProjectDatabase: mocks.closeProjectDatabase.mockImplementation(() => {
+    mocks.currentProjectPath = ''
+  }),
+  getCurrentProjectPath: () => mocks.currentProjectPath || null,
+  getProjectDb: () => mocks.currentProjectPath
+    ? { transaction: mocks.transaction }
+    : null,
+
+  createProjectDatabase: vi.fn((projectPath: string) => { mocks.createCalls.push(path.resolve(projectPath)) }),
+  initProjectDatabase: vi.fn((projectPath: string) => {
+    const resolved = path.resolve(projectPath)
+    mocks.initCalls.push(resolved)
+    // Mirrors the production initializer's `.vela/vela.db` parent creation.
+    mocks.createdVelaDirectories.add(path.join(resolved, '.vela'))
+    if (mocks.failInitPaths.has(resolved)) {
+      throw new Error(`cannot initialize ${resolved}`)
+    }
+    mocks.currentProjectPath = resolved
+  }),
+}))
+
+vi.mock('../../vector-store', () => ({
+  closeConnection: vi.fn(),
+}))
+
+vi.mock('../../utils/remove-directory', () => ({
+  removeDirectoryWithWindowsRetry: mocks.removeDirectoryWithWindowsRetry,
+}))
+
+vi.mock('../../utils/config-utils', () => ({
+  RECENT_PROJECTS_PATH: 'recent-projects.json',
+  readJsonFile: vi.fn(() => mocks.recentProjects),
+  writeJsonFile: mocks.writeJsonFile,
+}))
+
+vi.mock('../../repositories/project-core-repository', () => ({
+  ProjectCoreRepository: {
+    get: mocks.projectCoreGet.mockImplementation(() => {
+      const callback = mocks.onCoreGet
+      if (callback) {
+        mocks.onCoreGet = null
+        callback()
+      }
+      if (mocks.failCorePaths.has(mocks.currentProjectPath)) {
+        throw new Error(`cannot read ${mocks.currentProjectPath}`)
+      }
+      return {
+        projectName: path.basename(mocks.currentProjectPath),
+        genre: '',
+        subGenre: '',
+        targetAudience: '',
+        totalChapters: 100,
+        wordsPerChapter: 3000,
+        writingLanguage: 'en-US',
+        plotStructure: 'three_act',
+        narrativePov: 'third_limited',
+        coreOutline: '独立核心大纲',
+        worldSetting: '独立世界设定',
+        protagonistProfile: '独立主角设定',
+        synopsis: '',
+        worldbuilding: '',
+        goldenFinger: '',
+        charactersArch: '',
+        globalGuidance: '',
+        writingStyle: '',
+        referenceWorks: '',
+        characterStates: '',
+      }
+    }),
+    init: mocks.projectCoreInit,
+    update: mocks.projectCoreUpdate,
+  },
+}))
+
+vi.mock('../../services/sqlite-project-migration', () => ({
+  probeProjectSqlite: mocks.probeProjectSqlite,
+}))
+vi.mock('../../services/project-access', () => ({
+  projectAccess: mocks.projectAccess,
+  ProjectSessionStaleError: class ProjectSessionStaleError extends Error {
+    constructor(readonly code = 'PROJECT_SESSION_STALE') {
+      super(code)
+      this.name = 'ProjectSessionStaleError'
+    }
+  },
+}))
+
+vi.mock('../../i18n', () => ({
+  mainText: (systemLocale: string | undefined, zhCNText: string, enUSText: string) =>
+    (mocks.storedLocale ?? (systemLocale?.toLowerCase().startsWith('zh') ? 'zh-CN' : 'en-US')) === 'en-US' ? enUSText : zhCNText,
+}))
+
+vi.mock('../../services/project-peek', () => ({
+  projectPeekService: mocks.projectPeekService,
+}))
+
+vi.mock('../../services/external-file-grant-service', () => ({
+  externalFileGrants: { resolveExactPath: mocks.resolveExactPath, resolveDirectoryPath: mocks.resolveDirectoryPath,
+    issueDirectory: mocks.issueDirectory, revokeWebContents: mocks.revokeWebContents },
+}))
+
+vi.mock('../../services/legacy-project-copy-import', () => ({
+  importLegacyProjectCopy: mocks.importLegacyProjectCopy,
+}))
+
+import { registerProjectController } from '../project-controller'
+
+function selectedProject(projectPath: string) {
+  return { grantId: `selected:${projectPath}`, displayName: path.basename(projectPath) }
+}
+
+function handler(channel: string): IpcHandler {
+  const registered = mocks.handlers.get(channel)
+  if (!registered) throw new Error(`Missing IPC handler: ${channel}`)
+  return registered
+}
+
+function projectSession(
+  projectId = 'project-A',
+  projectPath = projectA,
+  leaseId = 'lease-project-A',
+) {
+  return { projectId, leaseId, projectPath }
+}
+
+const projectA = path.resolve('C:/projects/A')
+const projectB = path.resolve('C:/projects/B')
+const projectC = path.resolve('C:/projects/C')
+const projectD = path.resolve('C:/projects/D')
+const ordinaryDirectory = path.resolve('C:/ordinary-directory')
+
+beforeAll(() => {
+  registerProjectController()
+})
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  mocks.currentProjectPath = projectA
+  mocks.existingPaths = new Set([
+    projectA,
+    projectB,
+    projectD,
+    path.join(projectA, '.vela'),
+    path.join(projectB, '.vela'),
+    path.join(projectD, '.vela'),
+  ])
+  mocks.initCalls = []
+  mocks.createCalls = []
+  mocks.createdVelaDirectories = new Set()
+  mocks.failCorePaths = new Set()
+  mocks.failInitPaths = new Set()
+  mocks.onCoreGet = null
+  mocks.leaseSequence = 0
+  mocks.activeSession = {
+    kind: 'manifest',
+    projectId: 'project-A',
+    rootPath: projectA,
+    leaseId: 'lease-project-A',
+  }
+  mocks.recentProjects = []
+  mocks.probeProjectSqlite.mockReset().mockReturnValue({ schemaVersion: 0 })
+  mocks.issueDirectory.mockReturnValue({ grantId: 'legacy-source-grant' })
+  mocks.resolveDirectoryPath.mockImplementation(({ grantId }: { grantId: string }) => {
+    if (!grantId?.startsWith('selected:')) throw new Error('EXTERNAL_FILE_GRANT_NOT_FOUND')
+    return grantId.slice(9)
+  })
+  mocks.rmSync.mockImplementation(() => undefined)
+  mocks.removeDirectoryWithWindowsRetry.mockImplementation(async () => undefined)
+  mocks.writeJsonFile.mockImplementation((_target: string, data: unknown) => {
+    mocks.recentProjects = data as Array<{ name: string; path: string; updatedAt: string; projectId?: string }>
+  })
+  mocks.projectAccess.createProject.mockImplementation((parentPath: string, name: string) => ({
+    kind: 'manifest',
+    projectId: `project-${name}`,
+    rootPath: path.resolve(parentPath, name),
+  }))
+  mocks.projectAccess.probeExistingProject.mockImplementation((projectPath: string) => ({
+    kind: 'manifest',
+    projectId: `project-${path.basename(projectPath)}`,
+    rootPath: path.resolve(projectPath),
+  }))
+  mocks.projectAccess.adoptLegacyProject.mockImplementation((project: unknown) => project)
+  mocks.projectAccess.beginSession.mockImplementation((project: {
+    projectId: string
+    rootPath: string
+  }) => {
+    const session = {
+      kind: 'manifest' as const,
+      ...project,
+      leaseId: `lease-${project.projectId}-${++mocks.leaseSequence}`,
+    } as const
+    mocks.activeSession = session
+    return session
+  })
+  mocks.projectAccess.captureCurrentSession.mockImplementation(() => (
+    mocks.activeSession ? { ...mocks.activeSession } : null
+  ))
+  mocks.projectAccess.sameCanonicalProjectRoot.mockImplementation((left: string, right: string) => (
+    path.resolve(left).toLocaleLowerCase('en-US')
+      === path.resolve(right).toLocaleLowerCase('en-US')
+  ))
+  mocks.projectAccess.assertCurrentSession.mockImplementation((lease: {
+    projectId?: string
+    leaseId?: string
+  }) => {
+    const active = mocks.activeSession
+    if (
+      !active
+      || !lease.projectId
+      || !lease.leaseId
+      || active.projectId !== lease.projectId
+      || active.leaseId !== lease.leaseId
+    ) {
+      throw new Error('PROJECT_SESSION_STALE')
+    }
+    return { ...active }
+  })
+  mocks.projectAccess.assertCurrentProjectContext.mockImplementation((context: {
+    projectId?: string
+    leaseId?: string
+    projectPath?: string
+  } | undefined, currentProjectPath: string | null) => {
+    if (!context?.projectId || !context.leaseId || !context.projectPath) {
+      throw new Error('PROJECT_SESSION_REQUIRED')
+    }
+    const active = mocks.activeSession
+    if (
+      !active
+      || active.projectId !== context.projectId
+      || active.leaseId !== context.leaseId
+      || !mocks.projectAccess.sameCanonicalProjectRoot(active.rootPath, context.projectPath)
+    ) {
+      throw new Error('PROJECT_SESSION_STALE')
+    }
+    if (!currentProjectPath || !mocks.projectAccess.sameCanonicalProjectRoot(context.projectPath, currentProjectPath)) {
+      throw new Error('PROJECT_SESSION_DATABASE_MISMATCH')
+    }
+    return { ...active }
+  })
+  mocks.projectAccess.authorizeDeletion.mockImplementation((lease: unknown, projectPath: string) => {
+    const credential = lease as { projectId?: string; leaseId?: string }
+    if (!credential.projectId || !credential.leaseId) {
+      throw new Error('PROJECT_SESSION_STALE')
+    }
+    return path.resolve(projectPath)
+  })
+  mocks.projectAccess.invalidateCurrentSession.mockImplementation(() => {
+    mocks.activeSession = null
+  })
+  mocks.projectPeekService.issueCapability.mockImplementation((projectPath: string) => ({
+    capabilityId: `peek-${path.basename(projectPath)}`,
+    projectId: `project-${path.basename(projectPath)}`,
+  }))
+  mocks.projectPeekService.peek.mockReturnValue({ state: 'unavailable' })
+  mocks.projectPeekService.readCurrent.mockReturnValue({ state: 'unavailable' })
+})
+
+describe('native dialogs follow the interface language (#474)', () => {
+  it('falls back to the system language when no interface language was saved', async () => {
+    mocks.storedLocale = undefined
+    mocks.showOpenDialog.mockResolvedValue({ canceled: true, filePaths: [] })
+    for (const [systemLocale, title] of [['zh-CN', '选择项目目录'], ['en-US', 'Choose the project folder']]) {
+      mocks.systemLocale = systemLocale
+      await handler('dialog:select-folder')({ sender: { id: 17, once: vi.fn() } }, 'project-open')
+      expect(mocks.showOpenDialog).toHaveBeenLastCalledWith(expect.objectContaining({ title }))
+    }
+    mocks.systemLocale = 'zh-CN'
+    mocks.storedLocale = 'en-US'
+    await handler('dialog:select-folder')({ sender: { id: 17, once: vi.fn() } }, 'project-create')
+    expect(mocks.showOpenDialog).toHaveBeenLastCalledWith(expect.objectContaining({ title: 'Choose where to save the project' }))
+    mocks.storedLocale = undefined
+  })
+})
+
+describe('project controller project identity', () => {
+  it('issues only purpose-specific chooser grants and treats chooser cancellation normally', async () => {
+    const sender = { id: 17, once: vi.fn() }
+    mocks.issueDirectory.mockReturnValue({ grantId: 'chosen-grant' })
+    mocks.showOpenDialog.mockResolvedValue({ canceled: false, filePaths: [projectB] })
+    for (const purpose of ['project-create', 'project-open'] as const) {
+      await expect(handler('dialog:select-folder')({ sender }, purpose)).resolves.toEqual({ grantId: 'chosen-grant', displayName: 'B' })
+      expect(mocks.issueDirectory).toHaveBeenLastCalledWith({
+        webContentsId: 17, directoryPath: projectB, operations: [purpose], ttlMs: 600_000,
+      })
+    }
+    await expect(handler('dialog:select-legacy-project')({ sender })).resolves.toEqual({ grantId: 'chosen-grant', displayName: 'B' })
+    expect(mocks.issueDirectory).toHaveBeenLastCalledWith({
+      webContentsId: 17, directoryPath: projectB, operations: ['legacy-import'], ttlMs: 600_000,
+    })
+    sender.once.mock.calls[0][1]()
+    expect(mocks.revokeWebContents).toHaveBeenCalledWith(17)
+    mocks.issueDirectory.mockClear()
+    mocks.showOpenDialog.mockResolvedValue({ canceled: true, filePaths: [] })
+    await expect(handler('dialog:select-folder')({ sender }, 'project-open')).resolves.toBeNull()
+    await expect(handler('dialog:select-legacy-project')({ sender })).resolves.toBeNull()
+    expect(mocks.issueDirectory).not.toHaveBeenCalled()
+    await expect(handler('dialog:select-folder')({ sender }, 'write')).rejects.toThrow('PROJECT_DIRECTORY_GRANT_PURPOSE_INVALID')
+  })
+
+  it('rejects an unselected, unregistered raw project path before probing it', async () => {
+    await expect(handler('project:open')({ sender: { id: 17 } }, ordinaryDirectory, 'ungranted'))
+      .resolves.toMatchObject({ success: false })
+    expect(mocks.projectAccess.probeExistingProject).not.toHaveBeenCalled()
+  })
+
+  it('rejects raw creation paths and refused chooser grants before project access', async () => {
+    const sender = { sender: { id: 17 } }
+    await expect(handler('project:create')(sender, { name: 'B', path: projectB }, 'raw-create'))
+      .resolves.toMatchObject({ success: false })
+    expect(mocks.projectAccess.createProject).not.toHaveBeenCalled()
+    mocks.resolveDirectoryPath.mockImplementation(() => { throw new Error('EXTERNAL_FILE_GRANT_EXPIRED') })
+    await expect(handler('project:open')(sender, selectedProject(projectB), 'expired-open'))
+      .resolves.toMatchObject({ success: false })
+    expect(mocks.projectAccess.probeExistingProject).not.toHaveBeenCalled()
+  })
+
+  it('reopens persisted recent projects and rejects replaced identities before opening the database', async () => {
+    mocks.recentProjects = [{ name: 'B', path: projectB, updatedAt: '', projectId: 'project-B' }]
+    await expect(handler('project:open')({ sender: { id: 17 } }, projectB, 'history-open'))
+      .resolves.toMatchObject({ success: true })
+    expect(mocks.resolveDirectoryPath).not.toHaveBeenCalled()
+    mocks.initCalls = []
+    mocks.recentProjects = [{ name: 'B', path: projectD, updatedAt: '', projectId: 'different-id' }]
+    await expect(handler('project:open')({ sender: { id: 17 } }, projectD, 'history-replaced'))
+      .resolves.toMatchObject({ success: false })
+    expect(mocks.initCalls).not.toContain(projectD)
+  })
+  it('issues opaque preview capabilities for valid recent projects', async () => {
+    mocks.recentProjects = [{ name: 'Project B', path: projectB, updatedAt: '2026-09-21T00:00:00.000Z' }]
+
+    await expect(handler('project:recent-list')({})).resolves.toEqual([{
+      name: 'Project B',
+      path: projectB,
+      updatedAt: '2026-09-21T00:00:00.000Z',
+      previewCapabilityId: 'peek-B',
+      projectId: 'project-B',
+    }])
+    expect(mocks.projectPeekService.issueCapability).toHaveBeenCalledWith(projectB)
+  })
+
+  it('previews only capabilities issued by the current recent-project listing', async () => {
+    mocks.recentProjects = [{ name: 'Project B', path: projectB, updatedAt: '2026-09-21T00:00:00.000Z' }]
+    mocks.projectPeekService.peek.mockReturnValue({ state: 'ready', projectId: 'project-B' })
+    await handler('project:recent-list')({})
+
+    await expect(handler('project:peek-overview')({}, 'not-issued')).resolves.toEqual({ state: 'unavailable' })
+    expect(mocks.projectPeekService.peek).not.toHaveBeenCalled()
+    await expect(handler('project:peek-overview')({}, 'peek-B')).resolves.toMatchObject({ state: 'ready' })
+    expect(mocks.projectPeekService.peek).toHaveBeenCalledWith('peek-B')
+  })
+
+  it('reads the current overview only through the validated project session', async () => {
+    mocks.projectPeekService.readCurrent.mockReturnValue({ state: 'ready', projectId: 'project-A' })
+
+    await expect(handler('project:overview-current')({}, projectSession())).resolves.toMatchObject({
+      state: 'ready',
+      projectId: 'project-A',
+    })
+    expect(mocks.projectAccess.assertCurrentProjectContext).toHaveBeenCalledWith(projectSession(), projectA)
+    expect(mocks.projectPeekService.readCurrent).toHaveBeenCalledWith('project-A', expect.any(Object))
+  })
+
+  it('reports the live main-process project database context', async () => {
+    await expect(handler('project:get-runtime-context')({})).resolves.toEqual({
+      activeProjectPath: projectA,
+      dbReady: true,
+    })
+  })
+
+  it('opens a probe-verified project with its stable identity and a fresh main-process lease', async () => {
+    await expect(handler('project:open')({ sender: { id: 17 } }, selectedProject(projectB), 'request-open-B', projectA))
+      .resolves.toMatchObject({
+        success: true,
+        project: {
+          id: 'project-B',
+          path: projectB,
+          sessionLease: 'lease-project-B-1',
+          novelConfig: {
+            writingLanguage: 'en-US',
+            coreOutline: '独立核心大纲',
+            worldSetting: '独立世界设定',
+            protagonistProfile: '独立主角设定',
+          },
+        },
+      })
+    expect(mocks.projectAccess.probeExistingProject).toHaveBeenCalledWith(projectB)
+    expect(mocks.projectAccess.adoptLegacyProject).toHaveBeenCalled()
+    expect(mocks.projectAccess.beginSession).toHaveBeenCalled()
+    expect(mocks.createCalls).toEqual([])
+  })
+
+  it('opens a complete imported target after its publish ACK is lost and adds it to recent projects', async () => {
+    await expect(handler('project:recent-list')({})).resolves.toEqual([])
+    await expect(handler('project:open')({ sender: { id: 17 } }, selectedProject(projectB), 'recover-imported-B', projectA))
+      .resolves.toMatchObject({ success: true, project: { id: 'project-B', path: projectB } })
+    expect(mocks.projectAccess.probeExistingProject).toHaveBeenCalledWith(projectB)
+    expect(mocks.initCalls).toContain(projectB)
+    expect(mocks.createCalls).toEqual([])
+    await expect(handler('project:recent-list')({})).resolves.toEqual([
+      expect.objectContaining({ path: projectB, projectId: 'project-B', previewCapabilityId: 'peek-B' }),
+    ])
+  })
+
+  it('reopens the same project with a new lease while preserving its stable ProjectId', async () => {
+    const first = await handler('project:open')({ sender: { id: 17 } }, selectedProject(projectB), 'request-open-B-1', projectA)
+    const second = await handler('project:open')({ sender: { id: 17 } }, selectedProject(projectB), 'request-open-B-2', projectB)
+
+    expect(first).toMatchObject({
+      success: true,
+      project: { id: 'project-B', sessionLease: 'lease-project-B-1' },
+    })
+    expect(second).toMatchObject({
+      success: true,
+      project: { id: 'project-B', sessionLease: 'lease-project-B-2' },
+    })
+  })
+
+  it('deduplicates recent projects across Windows path casing, separators, and trailing slashes', async () => {
+    mocks.recentProjects = [{
+      name: 'old A',
+      path: 'c:/PROJECTS/A/',
+      updatedAt: 'old',
+    }]
+
+    await expect(handler('project:open')({ sender: { id: 17 } }, selectedProject(projectA), 'request-open-A', projectA))
+      .resolves.toMatchObject({ success: true })
+
+    expect(mocks.recentProjects).toEqual([
+      expect.objectContaining({ path: projectA }),
+    ])
+  })
+
+  it('serializes concurrent opens and rolls back when the latest request fails', async () => {
+    let latestRequest: Promise<unknown> | null = null
+    mocks.failCorePaths.add(projectD)
+    mocks.onCoreGet = () => {
+      latestRequest = handler('project:open')({ sender: { id: 17 } }, selectedProject(projectD), 'request-D', projectA)
+    }
+
+    const olderRequest = handler('project:open')({ sender: { id: 17 } }, selectedProject(projectB), 'request-B', projectA)
+    const olderResult = await olderRequest
+    expect(latestRequest).not.toBeNull()
+    const latestResult = await latestRequest!
+
+    expect(olderResult).toMatchObject({
+      success: false,
+      stale: true,
+      requestToken: 'request-B',
+    })
+    expect(latestResult).toMatchObject({
+      success: false,
+      requestToken: 'request-D',
+      activeProjectPath: projectA,
+      databaseRestored: true,
+      dbReady: true,
+    })
+    expect(mocks.initCalls).toEqual([projectB, projectA, projectD, projectA])
+    expect(mocks.currentProjectPath).toBe(projectA)
+  })
+
+  it('rolls a failed open back only to the captured trusted lease root, never the renderer path', async () => {
+    mocks.existingPaths.add(ordinaryDirectory)
+    mocks.failCorePaths.add(projectD)
+
+    await expect(handler('project:open')({ sender: { id: 17 } }, selectedProject(projectD),
+      'request-open-D-untrusted-renderer-path',
+      ordinaryDirectory,
+    )).resolves.toMatchObject({
+      success: false,
+      requestToken: 'request-open-D-untrusted-renderer-path',
+      activeProjectPath: projectA,
+      databaseRestored: true,
+      dbReady: true,
+    })
+
+    // `initProjectDatabase` creates `<root>/.vela/vela.db` in production. A
+    // renderer-supplied ordinary directory must never reach that authority.
+    expect(mocks.initCalls).toEqual([projectD, projectA])
+    expect(mocks.initCalls).not.toContain(ordinaryDirectory)
+    expect(mocks.createdVelaDirectories).not.toContain(path.join(ordinaryDirectory, '.vela'))
+    expect(mocks.projectAccess.captureCurrentSession).toHaveBeenCalledOnce()
+    expect(mocks.activeSession).toMatchObject({
+      rootPath: projectA,
+      leaseId: 'lease-project-A',
+    })
+  })
+
+  it('rolls a failed create back only to the captured trusted lease root, never the renderer path', async () => {
+    mocks.existingPaths.add(ordinaryDirectory)
+    mocks.projectCoreUpdate.mockImplementationOnce(() => {
+      throw new Error('cannot initialize project core')
+    })
+
+    await expect(handler('project:create')(
+      { sender: { id: 17 } },
+      {
+        name: 'C',
+        parentGrantId: `selected:${path.resolve('C:/projects')}`,
+        genre: 'fantasy',
+        targetAudience: 'all',
+      },
+      'request-create-C-untrusted-renderer-path',
+      ordinaryDirectory,
+    )).resolves.toMatchObject({
+      success: false,
+      requestToken: 'request-create-C-untrusted-renderer-path',
+      activeProjectPath: projectA,
+      databaseRestored: true,
+      dbReady: true,
+    })
+
+    expect(mocks.initCalls).toEqual([projectC, projectA])
+    expect(mocks.initCalls).not.toContain(ordinaryDirectory)
+    expect(mocks.createdVelaDirectories).not.toContain(path.join(ordinaryDirectory, '.vela'))
+    expect(mocks.projectAccess.captureCurrentSession).toHaveBeenCalledOnce()
+  })
+
+  it('returns a typed storage-path error before initializing a rejected project database', async () => {
+    mocks.projectAccess.createProject.mockImplementationOnce(() => {
+      throw Object.assign(new Error('请改用更靠近磁盘根目录的位置'), {
+        code: 'PROJECT_STORAGE_PATH_UNSUPPORTED',
+      })
+    })
+
+    await expect(handler('project:create')(
+      { sender: { id: 17 } },
+      {
+        name: 'C',
+        parentGrantId: `selected:${path.resolve('C:/projects')}`,
+        genre: 'fantasy',
+        targetAudience: 'all',
+      },
+      'request-create-C-unsafe-storage-path',
+      projectA,
+    )).resolves.toMatchObject({
+      success: false,
+      errorCode: 'PROJECT_STORAGE_PATH_UNSUPPORTED',
+      databaseRestored: true,
+      dbReady: true,
+    })
+
+    expect(mocks.initCalls).toEqual([projectA])
+    expect(mocks.initCalls).not.toContain(projectC)
+  })
+
+  it('returns an actionable typed error when the selected folder is not a project root', async () => {
+    mocks.projectAccess.probeExistingProject.mockImplementationOnce(() => {
+      throw Object.assign(new Error('selected parent is not a project root'), {
+        code: 'PROJECT_ROOT_REQUIRED',
+      })
+    })
+
+    await expect(handler('project:open')({ sender: { id: 17 } }, selectedProject(ordinaryDirectory),
+      'request-open-parent-directory',
+      projectA,
+    )).resolves.toMatchObject({
+      success: false,
+      errorCode: 'PROJECT_ROOT_REQUIRED',
+      databaseRestored: true,
+      dbReady: true,
+    })
+
+    expect(mocks.initCalls).toEqual([projectA])
+    expect(mocks.initCalls).not.toContain(ordinaryDirectory)
+  })
+
+  it('offers the selected recognized legacy project as a window-bound import source without opening it', async () => {
+    mocks.recentProjects = [{ name: 'B', path: projectB, updatedAt: '' }]
+    mocks.projectAccess.probeExistingProject.mockReturnValueOnce({
+      kind: 'manifest', projectId: 'old-B', rootPath: projectB, storageFormat: 'legacy',
+    })
+    mocks.projectAccess.adoptLegacyProject.mockImplementation(() => { throw new Error('PROJECT_MIGRATION_NOT_QUALIFIED') })
+    const sender = { id: 17, once: vi.fn() }
+    const result = await handler('project:open')({ sender }, projectB, 'request-legacy-B')
+    expect(result).toMatchObject({
+      success: false,
+      errorCode: 'PROJECT_LEGACY_IMPORT_REQUIRED',
+      legacyImportSource: { grantId: 'legacy-source-grant', displayName: 'B' },
+      databaseRestored: true,
+      dbReady: true,
+    })
+    expect(mocks.issueDirectory).toHaveBeenCalledWith({
+      webContentsId: 17, directoryPath: projectB, operations: ['legacy-import'], ttlMs: 600_000,
+    })
+    expect(mocks.initCalls).not.toContain(projectB)
+    expect(mocks.importLegacyProjectCopy).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['PROJECT_MIGRATION_RECOVERY_REQUIRED', '项目格式转换尚未具备安全迁移条件，已保留原项目且未写入。请通过“导入旧项目”创建完整副本。', 'This project cannot be converted safely yet. The original was kept and nothing was written. Use Import legacy project to create a complete copy.'],
+    ['UNRECOGNIZED_SCHEMA', '无法识别项目格式，已拒绝打开。请核查创建该项目的软件和版本。', 'The project format is not recognized, so it was not opened. Check which app and version created it.'],
+    ['CORRUPT_SCHEMA', '项目数据结构已损坏，已拒绝打开。请保留原件并从备份恢复。', 'The project data structure is damaged, so it was not opened. Keep the original and restore from a backup.'],
+    ['NEWER_SCHEMA_READ_ONLY', '该项目由更新版本创建，已拒绝打开。请升级软件后再打开。', 'This project was created by a newer version, so it was not opened. Update the app, then open it again.'],
+    ['LEGACY_IMPORT_UNSUPPORTED_SOURCE', '此项目版本不支持旧项目导入。请用原版本软件打开或导出。', 'Projects from this version cannot be imported as legacy projects. Open or export it with the app version that created it.'],
+  ])(
+    'explains %s without offering an import grant for a legacy project', async (reason, zhCN, enUS) => {
+      mocks.projectAccess.probeExistingProject.mockReturnValueOnce({
+        kind: 'manifest', projectId: 'old-B', rootPath: projectB, storageFormat: 'legacy',
+      })
+      mocks.projectAccess.adoptLegacyProject.mockImplementation(() => { throw new Error('PROJECT_MIGRATION_NOT_QUALIFIED') })
+      if (reason === 'PROJECT_MIGRATION_RECOVERY_REQUIRED') {
+        mocks.existingPaths.add(path.join(projectB, '.ai-novel-migration'))
+      } else if (reason === 'LEGACY_IMPORT_UNSUPPORTED_SOURCE') {
+        mocks.probeProjectSqlite.mockReturnValueOnce({ schemaVersion: 7 })
+      } else {
+        mocks.probeProjectSqlite.mockImplementationOnce(() => { throw new Error(reason) })
+      }
+      const result = await handler('project:open')({ sender: { id: 17, once: vi.fn() } }, selectedProject(projectB), 'request-legacy-blocked') as { error: string }
+      expect(appErrorMessage('zh-CN', result.error)).toBe(zhCN)
+      expect(appErrorMessage('en-US', result.error)).toBe(enUS)
+      expect(result).toMatchObject({
+        success: false,
+        databaseRestored: true,
+        dbReady: true,
+        activeProjectPath: projectA,
+      })
+      expect(result).not.toHaveProperty('legacyImportSource')
+      expect(mocks.issueDirectory).not.toHaveBeenCalled()
+      expect(mocks.initCalls).not.toContain(projectB)
+      expect(mocks.initCalls).toEqual([projectA])
+      expect(mocks.currentProjectPath).toBe(projectA)
+    },
+  )
+  it('preserves the actionable migration refusal instead of overwriting it with an internal code', async () => {
+    mocks.projectAccess.probeExistingProject.mockImplementationOnce(() => {
+      throw new Error('PROJECT_MIGRATION_NOT_QUALIFIED')
+    })
+    const result = await handler('project:open')({ sender: { id: 17 } }, selectedProject(ordinaryDirectory), 'request-unqualified-legacy') as { error: string }
+    expect(result).not.toHaveProperty('errorCode')
+    expect(appErrorMessage('en-US', result.error)).toBe('This project cannot be converted safely yet. The original was kept and nothing was written. Use Import legacy project to create a complete copy.')
+    expect(result).toMatchObject({
+      success: false,
+      databaseRestored: true,
+      dbReady: true,
+    })
+    expect(mocks.initCalls).toEqual([projectA])
+    expect(mocks.initCalls).not.toContain(ordinaryDirectory)
+  })
+
+  it('creates from a first-ever neutral runtime, returns to no database or lease, then opens explicitly', async () => {
+    mocks.currentProjectPath = ''
+    mocks.activeSession = null
+
+    const created = await handler('project:create')(
+      { sender: { id: 17 } },
+      {
+        name: 'C',
+        parentGrantId: `selected:${path.resolve('C:/projects')}`,
+        genre: 'fantasy',
+        targetAudience: 'all',
+      },
+      'request-create-C-first-ever',
+    )
+
+    expect(created).toMatchObject({
+      success: true,
+      projectId: 'project-C',
+      projectPath: projectC,
+      requestToken: 'request-create-C-first-ever',
+      activeProjectPath: null,
+      databaseRestored: true,
+      dbReady: true,
+    })
+    expect(mocks.currentProjectPath).toBe('')
+    expect(mocks.activeSession).toBeNull()
+    await expect(handler('project:get-runtime-context')({})).resolves.toEqual({
+      activeProjectPath: null,
+      dbReady: true,
+    })
+
+    expect(mocks.createCalls).toEqual([projectC])
+    await expect(handler('project:open')({ sender: { id: 17 } }, selectedProject(projectC), 'request-open-created-C'))
+      .resolves.toMatchObject({
+        success: true,
+        project: {
+          id: 'project-C',
+          path: projectC,
+          sessionLease: 'lease-project-C-1',
+        },
+        activeProjectPath: projectC,
+        databaseRestored: true,
+        dbReady: true,
+      })
+    expect(mocks.activeSession).toMatchObject({
+      projectId: 'project-C',
+      rootPath: projectC,
+      leaseId: 'lease-project-C-1',
+    })
+  })
+
+  it('initializes a new project with the writing language selected at creation time', async () => {
+    mocks.currentProjectPath = ''
+    mocks.activeSession = null
+
+    await expect(handler('project:create')(
+      { sender: { id: 17 } },
+      {
+        name: 'English novel',
+        parentGrantId: `selected:${path.resolve('C:/projects')}`,
+        genre: 'fantasy',
+        targetAudience: 'all',
+        writingLanguage: 'en-US',
+      },
+      'request-create-English-novel',
+    )).resolves.toMatchObject({ success: true })
+
+    expect(mocks.projectCoreInit).toHaveBeenCalledWith('English novel', 'en-US')
+  })
+
+  it('restores a failed first-ever create to neutral without touching an ordinary renderer path or reviving a lease', async () => {
+    mocks.currentProjectPath = ''
+    mocks.activeSession = null
+    mocks.existingPaths.add(ordinaryDirectory)
+    mocks.projectCoreUpdate.mockImplementationOnce(() => {
+      throw new Error('cannot initialize project core')
+    })
+
+    await expect(handler('project:create')(
+      { sender: { id: 17 } },
+      {
+        name: 'C',
+        parentGrantId: `selected:${path.resolve('C:/projects')}`,
+        genre: 'fantasy',
+        targetAudience: 'all',
+      },
+      'request-create-C-first-ever-failure',
+      ordinaryDirectory,
+    )).resolves.toMatchObject({
+      success: false,
+      requestToken: 'request-create-C-first-ever-failure',
+      activeProjectPath: null,
+      databaseRestored: true,
+      dbReady: true,
+      error: 'Error: cannot initialize project core',
+    })
+
+    expect(mocks.initCalls).toEqual([projectC])
+    expect(mocks.initCalls).not.toContain(ordinaryDirectory)
+    expect(mocks.createdVelaDirectories).not.toContain(path.join(ordinaryDirectory, '.vela'))
+    expect(mocks.currentProjectPath).toBe('')
+    expect(mocks.activeSession).toBeNull()
+    expect(mocks.projectAccess.beginSession).not.toHaveBeenCalled()
+  })
+
+  it('uses the captured trusted root for a stale open instead of creating a database below rendererProjectPath', async () => {
+    let latestRequest: Promise<unknown> | null = null
+    mocks.existingPaths.add(ordinaryDirectory)
+    mocks.failCorePaths.add(projectD)
+    mocks.onCoreGet = () => {
+      latestRequest = handler('project:open')({ sender: { id: 17 } }, selectedProject(projectD), 'request-D-after-B', projectA)
+    }
+
+    const olderResult = await handler('project:open')({ sender: { id: 17 } }, selectedProject(projectB),
+      'request-B-before-D',
+      ordinaryDirectory,
+    )
+    expect(latestRequest).not.toBeNull()
+    await latestRequest!
+
+    expect(olderResult).toMatchObject({
+      success: false,
+      stale: true,
+      requestToken: 'request-B-before-D',
+      activeProjectPath: projectA,
+      databaseRestored: true,
+      dbReady: true,
+    })
+    expect(mocks.initCalls).toEqual([projectB, projectA, projectD, projectA])
+    expect(mocks.initCalls).not.toContain(ordinaryDirectory)
+    expect(mocks.createdVelaDirectories).not.toContain(path.join(ordinaryDirectory, '.vela'))
+  })
+
+  it('fails closed rather than reviving an old same-root lease after that lease expires during recovery', async () => {
+    mocks.failCorePaths.add(projectD)
+    mocks.onCoreGet = () => {
+      // Same root, but a later open has already issued a new lease. The old
+      // operation's snapshot is no longer trusted even though its path matches.
+      mocks.activeSession = {
+        kind: 'manifest',
+        projectId: 'project-A',
+        rootPath: projectA,
+        leaseId: 'lease-project-A-new',
+      }
+    }
+
+    await expect(handler('project:open')({ sender: { id: 17 } }, selectedProject(projectD),
+      'request-open-D-expired-rollback',
+      projectA,
+    )).resolves.toMatchObject({
+      success: false,
+      requestToken: 'request-open-D-expired-rollback',
+      activeProjectPath: null,
+      databaseRestored: false,
+      dbReady: false,
+    })
+
+    expect(mocks.initCalls).toEqual([projectD])
+    expect(mocks.projectAccess.assertCurrentSession).toHaveBeenCalledWith(expect.objectContaining({
+      leaseId: 'lease-project-A',
+    }))
+    expect(mocks.closeProjectDatabase).toHaveBeenCalledOnce()
+    expect(mocks.projectAccess.invalidateCurrentSession).toHaveBeenCalledOnce()
+    expect(mocks.activeSession).toBeNull()
+  })
+
+  it('fails closed when a failed open has no trusted rollback snapshot', async () => {
+    mocks.activeSession = null
+    mocks.existingPaths.add(ordinaryDirectory)
+    mocks.failCorePaths.add(projectD)
+
+    await expect(handler('project:open')({ sender: { id: 17 } }, selectedProject(projectD),
+      'request-open-D-no-rollback-snapshot',
+      ordinaryDirectory,
+    )).resolves.toMatchObject({
+      success: false,
+      requestToken: 'request-open-D-no-rollback-snapshot',
+      activeProjectPath: null,
+      databaseRestored: false,
+      dbReady: false,
+      error: expect.stringContaining('PROJECT_ROLLBACK_UNTRUSTED'),
+    })
+
+    expect(mocks.initCalls).toEqual([projectD])
+    expect(mocks.createdVelaDirectories).not.toContain(path.join(ordinaryDirectory, '.vela'))
+    expect(mocks.closeProjectDatabase).toHaveBeenCalledOnce()
+    expect(mocks.projectAccess.invalidateCurrentSession).toHaveBeenCalledOnce()
+  })
+
+  it('serializes create with open and prevents a stale create from initializing a new database', async () => {
+    const creating = handler('project:create')(
+      { sender: { id: 17 } },
+      {
+        name: 'C',
+        parentGrantId: `selected:${path.resolve('C:/projects')}`,
+        genre: 'fantasy',
+        targetAudience: 'all',
+      },
+      'request-create-C',
+      projectA,
+    )
+    const opening = handler('project:open')({ sender: { id: 17 } }, selectedProject(projectB), 'request-open-B', projectA)
+
+    await expect(creating).resolves.toMatchObject({
+      success: false,
+      stale: true,
+      requestToken: 'request-create-C',
+    })
+    await expect(opening).resolves.toMatchObject({
+      success: true,
+      requestToken: 'request-open-B',
+      activeProjectPath: projectB,
+      databaseRestored: true,
+      dbReady: true,
+    })
+    expect(mocks.initCalls).not.toContain(projectC)
+    expect(mocks.currentProjectPath).toBe(projectB)
+  })
+
+  it('fails closed when open fails and trusted rollback cannot restore the previous project', async () => {
+    mocks.failCorePaths.add(projectD)
+    mocks.failInitPaths.add(projectA)
+
+    await expect(handler('project:open')({ sender: { id: 17 } }, selectedProject(projectD),
+      'request-open-D',
+      projectA,
+    )).resolves.toMatchObject({
+      success: false,
+      requestToken: 'request-open-D',
+      activeProjectPath: null,
+      databaseRestored: false,
+      dbReady: false,
+      error: expect.stringMatching(/cannot read[\s\S]*cannot initialize/),
+    })
+    expect(mocks.projectAccess.beginSession).not.toHaveBeenCalled()
+    expect(mocks.closeProjectDatabase).toHaveBeenCalledOnce()
+    expect(mocks.projectAccess.invalidateCurrentSession).toHaveBeenCalledOnce()
+  })
+
+  it('fails closed when create fails and trusted rollback cannot restore the previous project', async () => {
+    mocks.projectCoreUpdate.mockImplementationOnce(() => {
+      throw new Error('cannot initialize project core')
+    })
+    mocks.failInitPaths.add(projectA)
+
+    await expect(handler('project:create')(
+      { sender: { id: 17 } },
+      {
+        name: 'C',
+        parentGrantId: `selected:${path.resolve('C:/projects')}`,
+        genre: 'fantasy',
+        targetAudience: 'all',
+      },
+      'request-create-C-fail',
+      projectA,
+    )).resolves.toMatchObject({
+      success: false,
+      requestToken: 'request-create-C-fail',
+      activeProjectPath: null,
+      databaseRestored: false,
+      dbReady: false,
+      error: expect.stringMatching(/cannot initialize project core[\s\S]*cannot initialize/),
+    })
+    expect(mocks.projectAccess.beginSession).not.toHaveBeenCalled()
+    expect(mocks.closeProjectDatabase).toHaveBeenCalledOnce()
+    expect(mocks.projectAccess.invalidateCurrentSession).toHaveBeenCalledOnce()
+  })
+
+  it('rejects missing or stale project identities before project config writes', async () => {
+    const data = {
+      path: projectA,
+      sessionLease: 'lease-project-A',
+      name: 'Project A',
+      novelConfig: {
+        genre: 'fantasy',
+      },
+    }
+
+    const saveWithoutIdentity = await handler('project:save')({}, 'main', data)
+    const saveWithStaleIdentity = await handler('project:save')({}, 'main', data, projectB)
+    const saveWithMismatchedPayload = await handler('project:save')(
+      {},
+      'main',
+      { ...data, path: projectB },
+      projectA,
+    )
+    const updateWithoutIdentity = await handler('project:update-config')({}, 'main', data)
+    const updateWithStaleIdentity = await handler('project:update-config')(
+      {},
+      'main',
+      data,
+      projectB,
+    )
+
+    expect(saveWithoutIdentity).toMatchObject({ success: false })
+    expect(saveWithStaleIdentity).toMatchObject({ success: false })
+    expect(saveWithMismatchedPayload).toMatchObject({ success: false })
+    expect(updateWithoutIdentity).toMatchObject({ success: false })
+    expect(updateWithStaleIdentity).toMatchObject({ success: false })
+    expect(mocks.projectCoreUpdate).not.toHaveBeenCalled()
+  })
+
+  it('rejects a project config write that omits its session lease even when its path is current', async () => {
+    const result = await handler('project:save')({}, 'project-A', {
+      path: projectA,
+      name: 'Project A',
+      novelConfig: { genre: 'fantasy' },
+    }, projectA)
+
+    expect(result).toMatchObject({
+      success: false,
+      error: 'Error: PROJECT_SESSION_REQUIRED',
+    })
+    expect(mocks.projectCoreUpdate).not.toHaveBeenCalled()
+  })
+
+  it('allows project config writes only for the explicitly active project', async () => {
+    const data = {
+      path: projectA,
+      sessionLease: 'lease-project-A',
+      name: 'Project A',
+      novelConfig: {
+        genre: 'fantasy',
+      },
+    }
+
+    await expect(handler('project:save')({}, 'project-A', data, projectA, projectSession()))
+      .resolves.toMatchObject({ success: true, recentProjectUpdated: true })
+    await expect(handler('project:update-config')({}, 'project-A', data, projectA, projectSession()))
+      .resolves.toEqual({ success: true })
+    expect(mocks.projectCoreUpdate).toHaveBeenCalled()
+    expect(mocks.transaction).toHaveBeenCalled()
+  })
+
+  it('persists the project creative strategy independently from model settings', async () => {
+    const data = {
+      path: projectA,
+      sessionLease: 'lease-project-A',
+      name: 'Project A',
+      novelConfig: {
+        genre: 'fantasy',
+        creativeStrategy: 'consistency-first',
+      },
+    }
+
+    await expect(handler('project:save')({}, 'project-A', data, projectA, projectSession()))
+      .resolves.toMatchObject({ success: true })
+    expect(mocks.projectCoreUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      creativeStrategy: 'consistency-first',
+    }))
+  })
+
+  it('persists the project writing language independently from the application locale', async () => {
+    const data = {
+      path: projectA,
+      sessionLease: 'lease-project-A',
+      name: 'Project A',
+      novelConfig: {
+        genre: 'fantasy',
+        writingLanguage: 'en-US',
+      },
+    }
+
+    await expect(handler('project:save')({}, 'project-A', data, projectA, projectSession()))
+      .resolves.toMatchObject({ success: true })
+    expect(mocks.projectCoreUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      writingLanguage: 'en-US',
+    }))
+  })
+
+  it('does not reset a saved creative strategy during an unrelated partial config write', async () => {
+    const data = {
+      path: projectA,
+      sessionLease: 'lease-project-A',
+      novelConfig: { genre: 'mystery' },
+    }
+
+    await expect(handler('project:update-config')({}, 'project-A', data, projectA, projectSession()))
+      .resolves.toEqual({ success: true })
+    expect(mocks.projectCoreUpdate).toHaveBeenCalledOnce()
+    expect(mocks.projectCoreUpdate.mock.calls[0]?.[0]).not.toHaveProperty('creativeStrategy')
+  })
+
+  it('rejects a supplied stale session lease before a project config write commits', async () => {
+    mocks.projectAccess.assertCurrentProjectContext.mockImplementationOnce(() => {
+      throw new Error('PROJECT_SESSION_STALE')
+    })
+    const data = {
+      path: projectA,
+      sessionLease: 'stale-lease',
+      novelConfig: { genre: 'fantasy' },
+    }
+
+    await expect(handler('project:save')({}, 'project-A', data, projectA, projectSession('project-A', projectA, 'stale-lease')))
+      .resolves.toMatchObject({
+        success: false,
+        error: 'Error: PROJECT_SESSION_STALE',
+      })
+    expect(mocks.projectCoreUpdate).not.toHaveBeenCalled()
+  })
+
+  it('reports the SQLite commit accurately when updating recent projects fails afterward', async () => {
+    mocks.writeJsonFile.mockImplementationOnce(() => {
+      throw new Error('recent list locked')
+    })
+    const data = {
+      path: projectA,
+      sessionLease: 'lease-project-A',
+      name: 'Project A',
+      characterStates: 'committed',
+    }
+
+    await expect(handler('project:save')({}, 'project-A', data, projectA, projectSession())).resolves.toMatchObject({
+      success: true,
+      recentProjectUpdated: false,
+    })
+    expect(mocks.projectCoreUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      projectName: 'Project A',
+      characterStates: 'committed',
+    }))
+  })
+
+  it('removes a missing project from recent navigation without deleting project data', async () => {
+    const movedProject = path.resolve('C:/projects/moved-away')
+    mocks.recentProjects = [
+      { name: 'Moved', path: movedProject, updatedAt: '2026-09-01T00:00:00.000Z' },
+      { name: 'Project A', path: projectA, updatedAt: '2026-09-02T00:00:00.000Z' },
+    ]
+
+    await expect(handler('project:recent-remove')({}, movedProject)).resolves.toEqual({ success: true })
+
+    expect(mocks.recentProjects).toEqual([
+      { name: 'Project A', path: projectA, updatedAt: '2026-09-02T00:00:00.000Z' },
+    ])
+    expect(mocks.removeDirectoryWithWindowsRetry).not.toHaveBeenCalled()
+    expect(mocks.projectAccess.assertCurrentProjectContext).not.toHaveBeenCalled()
+  })
+
+  it('reopens the active database and reports failure when the project directory remains', async () => {
+    mocks.removeDirectoryWithWindowsRetry.mockImplementationOnce(() => {
+      throw new Error('directory locked')
+    })
+
+    await expect(handler('project:delete')({}, projectA, 'project-A', 'lease-project-A', projectSession())).resolves.toMatchObject({
+      success: false,
+      directoryDeleted: false,
+      databaseRestored: true,
+      error: expect.stringContaining('directory locked'),
+    })
+    expect(mocks.initCalls).toContain(projectA)
+    expect(mocks.currentProjectPath).toBe(projectA)
+    expect(mocks.projectAccess.invalidateCurrentSession).not.toHaveBeenCalled()
+  })
+
+  it('reports that the database was not restored after a failed active-project delete', async () => {
+    mocks.removeDirectoryWithWindowsRetry.mockImplementationOnce(() => {
+      throw new Error('directory locked')
+    })
+    mocks.failInitPaths.add(projectA)
+
+    await expect(handler('project:delete')({}, projectA, 'project-A', 'lease-project-A', projectSession())).resolves.toMatchObject({
+      success: false,
+      directoryDeleted: false,
+      databaseRestored: false,
+      error: expect.stringMatching(/directory locked[\s\S]*cannot initialize/),
+    })
+    expect(mocks.currentProjectPath).toBe('')
+  })
+
+  it('reports deletion success when the directory commit succeeds but recent-list cleanup fails', async () => {
+    mocks.removeDirectoryWithWindowsRetry.mockImplementationOnce((target: string) => {
+      mocks.existingPaths.delete(path.resolve(target))
+    })
+    mocks.writeJsonFile.mockImplementationOnce(() => {
+      throw new Error('recent list locked')
+    })
+
+    await expect(handler('project:delete')({}, projectA, 'project-A', 'lease-project-A', projectSession())).resolves.toMatchObject({
+      success: true,
+      directoryDeleted: true,
+      databaseRestored: false,
+      warning: expect.stringContaining('recent list locked'),
+    })
+    expect(mocks.currentProjectPath).toBe('')
+    expect(mocks.projectAccess.invalidateCurrentSession).toHaveBeenCalledOnce()
+    expect(mocks.removeDirectoryWithWindowsRetry).toHaveBeenCalledWith(projectA)
+  })
+
+  it('rejects deletion without a current project session context before touching the filesystem', async () => {
+    await expect(handler('project:delete')({}, projectA)).resolves.toMatchObject({
+      success: false,
+      directoryDeleted: false,
+      error: 'Error: PROJECT_SESSION_REQUIRED',
+    })
+    expect(mocks.removeDirectoryWithWindowsRetry).not.toHaveBeenCalled()
+  })
+
+  it('rejects a stale session context for deletion even when the same project path is still open', async () => {
+    mocks.projectAccess.assertCurrentProjectContext.mockImplementationOnce(() => {
+      throw new Error('PROJECT_SESSION_STALE')
+    })
+
+    await expect(handler('project:delete')(
+      {},
+      projectA,
+      'project-A',
+      'legacy-lease-argument',
+      projectSession('project-A', projectA, 'stale-lease'),
+    )).resolves.toMatchObject({
+      success: false,
+      directoryDeleted: false,
+      error: 'Error: PROJECT_SESSION_STALE',
+    })
+    expect(mocks.removeDirectoryWithWindowsRetry).not.toHaveBeenCalled()
+  })
+
+  it('rejects a leased deletion when its project is no longer the active database root', async () => {
+    mocks.currentProjectPath = projectB
+
+    await expect(handler('project:delete')({}, projectA, 'project-A', 'lease-project-A', projectSession('project-A', projectA)))
+      .resolves.toMatchObject({
+        success: false,
+        directoryDeleted: false,
+        error: expect.stringContaining('PROJECT_SESSION_DATABASE_MISMATCH'),
+      })
+    expect(mocks.removeDirectoryWithWindowsRetry).not.toHaveBeenCalled()
+  })
+
+  it('cleans the local cloud binding only after the project directory deletion commits', async () => {
+    const removeDeletedProjectBinding = vi.fn()
+    registerProjectController({ removeDeletedProjectBinding })
+    mocks.removeDirectoryWithWindowsRetry.mockImplementationOnce((target: string) => {
+      mocks.existingPaths.delete(path.resolve(target))
+    })
+
+    await expect(handler('project:delete')(
+      {},
+      projectA,
+      'project-A',
+      'lease-project-A',
+      projectSession(),
+    )).resolves.toMatchObject({ success: true, directoryDeleted: true })
+    expect(removeDeletedProjectBinding).toHaveBeenCalledWith('project-A')
+
+    registerProjectController()
+  })
+})
+
+describe('legacy project copy import target grant', () => {
+  const sender = { sender: { id: 17 } }
+  const legacyRoot = path.resolve('C:/old/book')
+  const grantedTarget = path.resolve('C:/new/book-copy')
+
+  beforeEach(() => {
+    mocks.showMessageBox.mockReset().mockResolvedValue({ response: 1 })
+    mocks.importLegacyProjectCopy.mockReset().mockImplementation(async (input: { targetRoot: string }) => ({
+      state: 'ready', projectId: 'copy-id', targetRoot: input.targetRoot,
+    }))
+    mocks.resolveExactPath.mockReset().mockReturnValue(grantedTarget)
+  })
+
+  it('imports into the main-process path resolved from the sender-bound chooser grant', async () => {
+    await expect(handler('project:import-legacy-copy')(sender, `selected:${legacyRoot}`, 'restore-target-grant'))
+      .resolves.toEqual({ state: 'ready', projectId: 'copy-id', targetRoot: grantedTarget })
+
+    expect(mocks.resolveExactPath).toHaveBeenCalledExactlyOnceWith({
+      grantId: 'restore-target-grant', webContentsId: 17, operation: 'create',
+    })
+    expect(mocks.importLegacyProjectCopy).toHaveBeenCalledExactlyOnceWith({
+      sourceRoot: legacyRoot, targetRoot: grantedTarget,
+    })
+  })
+
+  it('never reaches the importer when the grant is refused or the argument is not a grant id', async () => {
+    mocks.resolveExactPath.mockImplementation(() => { throw new Error('EXTERNAL_FILE_GRANT_WRONG_WINDOW') })
+
+    await expect(handler('project:import-legacy-copy')(sender, `selected:${legacyRoot}`, path.resolve('C:/attacker/raw-target')))
+      .resolves.toEqual({ state: 'blocked', code: 'LEGACY_IMPORT_PATH_INVALID' })
+    await expect(handler('project:import-legacy-copy')(sender, `selected:${legacyRoot}`, undefined))
+      .resolves.toEqual({ state: 'blocked', code: 'LEGACY_IMPORT_PATH_INVALID' })
+
+    expect(mocks.importLegacyProjectCopy).not.toHaveBeenCalled()
+  })
+
+  it('does not consume the grant when the user cancels the confirmation', async () => {
+    mocks.showMessageBox.mockResolvedValue({ response: 0 })
+
+    await expect(handler('project:import-legacy-copy')(sender, `selected:${legacyRoot}`, 'restore-target-grant'))
+      .resolves.toEqual({ state: 'cancelled' })
+
+    expect(mocks.resolveExactPath).not.toHaveBeenCalled()
+    expect(mocks.importLegacyProjectCopy).not.toHaveBeenCalled()
+  })
+})

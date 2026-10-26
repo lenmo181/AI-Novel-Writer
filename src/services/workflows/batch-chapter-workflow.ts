@@ -1,0 +1,451 @@
+import { useProjectStore } from '../../stores/project-store'
+import { MAX_BATCH_CHAPTERS, MIN_BATCH_CHAPTERS, type GenerationBatchProgress } from '../../shared/generation-owner-contract'
+import { hashAuthorText } from '../../shared/source-ref'
+import { parseResourceUri } from '../../shared/project-paths'
+import { workflowResourceKey, type WorkflowContext, type WorkflowDefinition, type WorkflowStep, type StepCallbacks } from '../../stores/workflow-store'
+import { ipc } from '../ipc-client'
+import { guardChapterWriting } from '../workflow-guards'
+import type { ChapterInfo } from './chapter-workflow'
+import type { ChapterBlueprint } from './directory-workflow'
+import { GenerateDraftCommand } from './commands/generate-draft.command'
+import type { SelectedCandidateDraft } from './chapter-materials'
+import { FinalizeChapterCommand, RunFinalizePostProcessCommand } from './commands/finalize-chapter.command'
+import { retryFinalizationPublication } from '../finalization-client'
+import type { Locale } from '../../i18n/types'
+import type { ProjectSessionContext } from '../../shared/ipc-channels'
+import { sameProjectPathKey } from '../../shared/project-session-context'
+import { finalizationContentRevision, type FinalizationSnapshot } from '../finalization-snapshot'
+import { FINALIZATION_SHARED_WRITE_RESOURCE_KINDS } from '../../shared/workflow-resource-claims'
+import { requireWorkflowProjectSession, workflowMainProcessError } from './workflow-project-session'
+import { normalizeChapterWordsTarget } from './chapter-creation-parameters'
+
+/** 单次批量创作的安全上限，避免无边界调用模型；主进程准入（assertGenerationBatchIntent）同样执行。 */
+export { MAX_BATCH_CHAPTERS, MIN_BATCH_CHAPTERS }
+
+export type BatchChapterCompletionMode = 'draft_review' | 'auto_finalize'
+
+export interface BatchChapterWorkflowParams {
+  projectPath: string
+  /** 点击开始时冻结的完整项目 lease，禁止工厂借用当前项目。 */
+  projectSession: ProjectSessionContext
+  /** 从哪一章开始，通常是当前第一章未定稿的蓝图 */
+  startChapterNumber: number
+  /** 本次连续创作章节数（强制限制为 1–10） */
+  chapterCount: number
+  /** 任务面板中的章节名称跟随应用界面语言 */
+  locale?: Locale
+  /** 由批量创作入口选择并冻结；批量任务禁止回退到运行时默认模型。 */
+  generationModelId: string
+  /** 点击开始时从全局默认值初始化并由用户确认，本批次每章一致。 */
+  chapterWordsTarget?: number
+  /** 点击开始时冻结；草稿待审与自动定稿在同一批次内不得混用。 */
+  completionMode: BatchChapterCompletionMode
+  /** Exact main-issued batch identity selected for recovery. */
+  resumeBatchId?: string
+}
+
+export interface BatchChapterWorkflowDefinition extends WorkflowDefinition {
+  /** 批量任务必须携带启动时冻结的非空生成模型。 */
+  generationModelId: string
+  /** 随定义冻结的每章目标可见单位。 */
+  chapterWordsTarget: number
+  /** 随定义冻结的批量完成模式，供启动收据与 UI 验证。 */
+  completionMode: BatchChapterCompletionMode
+  /** Exact main-issued batch identity selected for recovery. */
+  resumeBatchId?: string
+}
+
+/** 将 UI 或外部输入收敛到安全的 1–10 章范围。 */
+export function normalizeBatchChapterCount(value: number | string | null | undefined): number {
+  const parsed = Math.trunc(Number(value))
+  if (!Number.isFinite(parsed)) return MIN_BATCH_CHAPTERS
+  return Math.min(MAX_BATCH_CHAPTERS, Math.max(MIN_BATCH_CHAPTERS, parsed))
+}
+
+function normalizeGenerationModelId(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined
+}
+
+function normalizeCompletionMode(value: unknown): BatchChapterCompletionMode {
+  return value === 'auto_finalize' ? 'auto_finalize' : 'draft_review'
+}
+
+function localeText(locale: Locale, zhCNText: string, enUSText: string): string {
+  return locale === 'en-US' ? enUSText : zhCNText
+}
+
+function toChapterInfo(
+  blueprint: ChapterBlueprint,
+  projectPath: string,
+  chapterWordsTarget: number,
+): ChapterInfo {
+  return {
+    projectPath,
+    chapterNumber: blueprint.chapterNumber,
+    title: blueprint.title || `第${blueprint.chapterNumber}章`,
+    role: blueprint.role ?? '发展',
+    purpose: blueprint.purpose || '',
+    characters: Array.isArray(blueprint.characters) ? blueprint.characters : [],
+    keyEvents: blueprint.keyEvents || '',
+    suspenseHook: blueprint.suspenseHook || '',
+    userGuidance: blueprint.userGuidance || '',
+    wordsTarget: chapterWordsTarget,
+  }
+}
+
+function throwIfCancelled(context: WorkflowContext, uiLocale: Locale) {
+  if (context.cancelled) {
+    throw new Error(localeText(uiLocale, '批量创作已取消', 'Batch writing was cancelled.'))
+  }
+}
+
+/**
+ * Bind the draft tab opened by GenerateDraftCommand to the same immutable
+ * snapshot consumed by automatic finalization. Existing reconciliation then
+ * marks an unchanged tab read-only and preserves any concurrent author edit as
+ * a conflict instead of silently closing or overwriting it.
+ */
+async function captureBatchFinalizationSnapshot(
+  draftPath: string,
+  draftContent: string,
+  chapterNumber: number,
+  chapterTitle: string,
+  projectPath: string,
+  projectSession: ProjectSessionContext,
+): Promise<FinalizationSnapshot | undefined> {
+  const resource = parseResourceUri(draftPath)
+  if (resource?.kind !== 'draft' || resource.legacy) return undefined
+  const draftId = resource.id
+
+  try {
+    const { useEditorStore } = await import('../../stores/editor-store')
+    const tab = useEditorStore.getState().tabs.find(candidate => (
+      candidate.filePath === draftPath
+      && candidate.type === 'chapter'
+      && sameProjectPathKey(candidate.projectKey, projectPath)
+    ))
+    if (!tab) return undefined
+
+    const contentRevision = tab.contentRevision ?? 0
+    useEditorStore.setState(state => ({
+      tabs: state.tabs.map(candidate => candidate.id === tab.id
+        ? {
+          ...candidate,
+          draftId,
+          chapterNumber,
+          draftStatus: 'draft',
+          projectSessionLease: projectSession.leaseId,
+          contentRevision,
+        }
+        : candidate),
+    }))
+
+    return Object.freeze({
+      tabId: tab.id,
+      projectPath,
+      projectSession: Object.freeze({ ...projectSession }),
+      draftId,
+      chapterNumber,
+      chapterTitle,
+      content: draftContent,
+      contentRevision: finalizationContentRevision(contentRevision),
+    })
+  } catch {
+    // Editor binding is a renderer projection. Finalization can still use its
+    // database-backed fallback when the tab was not opened or already closed.
+    return undefined
+  }
+}
+
+async function runOneBatchChapter(
+  projectPath: string,
+  batchStartChapterNumber: number,
+  chapterNumber: number,
+  chapterWordsTarget: number,
+  completionMode: BatchChapterCompletionMode,
+  uiLocale: Locale,
+  step: WorkflowStep,
+  context: WorkflowContext,
+  callbacks: StepCallbacks,
+  batchState: { batchId?: string; params: BatchChapterWorkflowParams },
+): Promise<string> {
+  const projectSession = requireWorkflowProjectSession(context)
+  let progress: GenerationBatchProgress
+  if (batchState.batchId) {
+    progress = await ipc.invokeWithProjectSession(projectSession, 'generation:read-batch', { batchId: batchState.batchId })
+  } else {
+    const config = useProjectStore.getState().currentProject?.novelConfig
+    if (!config) throw new Error('GENERATION_BATCH_AUTHOR_CONFIG_REQUIRED')
+    progress = await ipc.invokeWithProjectSession(projectSession, 'generation:begin-batch', {
+      uiActionNonce: `${context.runId}:batch`, modelId: batchState.params.generationModelId,
+      mode: completionMode, range: { startChapter: batchStartChapterNumber,
+        endChapter: batchStartChapterNumber + normalizeBatchChapterCount(batchState.params.chapterCount) - 1 },
+      targetUnits: chapterWordsTarget, promptKeys: ['first_chapter_draft', 'next_chapter_draft'], skillStages: ['drafting'],
+      authorInputs: [{ id: 'draft:author-config', text: JSON.stringify(config) },
+        { id: 'draft:target-units', text: String(chapterWordsTarget) }],
+    })
+    batchState.batchId = progress.batchId
+  }
+  if (progress.mode !== completionMode || progress.targetUnits !== chapterWordsTarget
+    || progress.range.startChapter !== batchStartChapterNumber
+    || progress.range.endChapter !== batchStartChapterNumber + normalizeBatchChapterCount(batchState.params.chapterCount) - 1)
+    throw new Error('GENERATION_BATCH_INTENT_MISMATCH')
+  context.mainGenerationRootHandle = Object.freeze({ ...progress.rootHandle })
+  context.data.generationBatchId = progress.batchId
+  const saved = progress.completedChapters.find(item => item.chapterNumber === chapterNumber)
+  if (saved && (progress.nextChapterNumber === null || progress.nextChapterNumber > chapterNumber))
+    return localeText(uiLocale, `第${chapterNumber}章已保存，未重复生成。`, `Chapter ${chapterNumber} was already saved and was not generated again.`)
+  if (progress.nextChapterNumber !== chapterNumber) throw new Error('GENERATION_BATCH_CHAPTER_ORDER_MISMATCH')
+  const selectedCandidates: SelectedCandidateDraft[] = []
+  const predecessor = completionMode === 'draft_review'
+    ? progress.completedChapters.find(item => item.chapterNumber === chapterNumber - 1) : undefined
+  if (predecessor) {
+    const stored = await ipc.invokeWithProjectSession(projectSession, 'db:draft-get-full', predecessor.draftId, projectPath)
+    if (!stored || stored.version !== predecessor.version || await hashAuthorText(stored.content) !== predecessor.contentHash)
+      throw new Error('GENERATION_BATCH_PREDECESSOR_CHANGED')
+    selectedCandidates.push({ chapterNumber: predecessor.chapterNumber, draftId: predecessor.draftId,
+      version: predecessor.version, content: stored.content, required: true })
+  }
+  // 草稿待审模式不会把本批次前一章变成定稿事实；首章仍遵守外部连续性门禁，
+  // 后续章只重复校验蓝图/角色等全局前置条件。
+  const guardedChapterNumber = completionMode === 'draft_review' && chapterNumber > batchStartChapterNumber
+    ? undefined
+    : chapterNumber
+  const guard = await guardChapterWriting(guardedChapterNumber, projectPath, projectSession, uiLocale)
+  if (!guard.ok) {
+    throw new Error(guard.message || localeText(
+      uiLocale,
+      `第${chapterNumber}章不满足创作前置条件`,
+      `Chapter ${chapterNumber} does not meet the writing prerequisites.`,
+    ))
+  }
+
+  const [blueprint, existingDraft] = await Promise.all([
+    ipc.invokeWithProjectSession(projectSession, 'db:blueprint-get', chapterNumber, projectPath),
+    ipc.invokeWithProjectSession(projectSession, 'db:draft-get-latest', chapterNumber, projectPath),
+  ])
+  if (!blueprint) {
+    throw new Error(localeText(
+      uiLocale,
+      `未找到第${chapterNumber}章蓝图，批量创作已停止`,
+      `No blueprint was found for Chapter ${chapterNumber}. Batch writing stopped.`,
+    ))
+  }
+  if (existingDraft && (!saved || existingDraft.id !== saved.draftId)) {
+    throw new Error(localeText(
+      uiLocale,
+      `第${chapterNumber}章已有草稿，批量创作不会覆盖既有内容`,
+      `Chapter ${chapterNumber} already has a draft. Batch writing will not overwrite it.`,
+    ))
+  }
+
+  const chapterInfo = toChapterInfo(blueprint as ChapterBlueprint, projectPath, chapterWordsTarget)
+  callbacks.log(completionMode === 'draft_review'
+    ? localeText(
+      uiLocale,
+      `开始第${chapterNumber}章：生成草稿待审。`,
+      `Starting Chapter ${chapterNumber}: generate a review draft.`,
+    )
+    : localeText(
+      uiLocale,
+      `开始第${chapterNumber}章：生成草稿、自动定稿并完成后处理。`,
+      `Starting Chapter ${chapterNumber}: generate, auto-finalize, and post-process.`,
+    ))
+  callbacks.setProgress(5)
+
+  const savedDraft = saved ? await ipc.invokeWithProjectSession(projectSession, 'db:draft-get-full', saved.draftId, projectPath) : null
+  if (saved && (!savedDraft || savedDraft.version !== saved.version || await hashAuthorText(savedDraft.content) !== saved.contentHash))
+    throw new Error('GENERATION_BATCH_SAVED_DRAFT_CHANGED')
+  const draftContent = savedDraft?.content ?? await new GenerateDraftCommand(chapterInfo, {
+    batchId: progress.batchId, selectedCandidateDrafts: selectedCandidates,
+    ...(progress.currentChapterRunHandle ? { resumeHandle: progress.currentChapterRunHandle } : {}),
+  }).execute({ step, context, callbacks })
+  if (saved) {
+    context.data.draftId = saved.draftId
+    context.data.draftVersion = saved.version
+    context.data.draftPath = `ai-novel://draft/${saved.draftId}`
+  }
+  throwIfCancelled(context, uiLocale)
+  if (completionMode === 'draft_review') {
+    const draftId = Number(context.data.draftId)
+    const version = Number(context.data.draftVersion)
+    if (!Number.isSafeInteger(draftId) || !Number.isSafeInteger(version)) {
+      throw new Error(localeText(
+        uiLocale,
+        `第${chapterNumber}章草稿已保存，但缺少可冻结的草稿身份，批量创作已停止`,
+        `Chapter ${chapterNumber} was saved, but its draft identity could not be frozen. Batch writing stopped.`,
+      ))
+    }
+    const committed = await ipc.invokeWithProjectSession(projectSession, 'generation:read-batch', { batchId: progress.batchId })
+    if (!committed.completedChapters.some(item => item.chapterNumber === chapterNumber && item.draftId === draftId && item.version === version))
+      throw new Error('GENERATION_BATCH_DRAFT_RECEIPT_REQUIRED')
+    callbacks.setProgress(100)
+    return localeText(
+      uiLocale,
+      `第${chapterNumber}章草稿已生成并保存，等待审稿。`,
+      `Chapter ${chapterNumber} draft was generated and saved for review.`,
+    )
+  }
+
+  callbacks.setProgress(55)
+
+  const draftPath = String(context.data.draftPath || '')
+  if (!draftPath) {
+    throw new Error(localeText(
+      uiLocale,
+      `第${chapterNumber}章草稿已生成，但未取得草稿路径`,
+      `Chapter ${chapterNumber} was generated, but its draft path is unavailable.`,
+    ))
+  }
+
+  const existingFinalizationId = saved?.pendingFinalizationId ?? saved?.finalizationId
+  const snapshot = existingFinalizationId ? undefined : await captureBatchFinalizationSnapshot(
+    draftPath,
+    draftContent,
+    chapterNumber,
+    chapterInfo.title,
+    projectPath,
+    projectSession,
+  )
+  throwIfCancelled(context, uiLocale)
+
+  if (existingFinalizationId) {
+    if (saved?.pendingFinalizationId) {
+      const publication = await retryFinalizationPublication(existingFinalizationId, projectSession)
+      if (!publication.success) {
+        // committed 为 false 时重试根本没执行（定稿记录已不在、会话不对），不能说定稿已提交。
+        throw publication.committed
+          ? workflowMainProcessError({ uiLocale }, publication.error, '定稿已提交、实体稿待发布', 'Finalization was committed, but manuscript publication is still pending.')
+          : workflowMainProcessError({ uiLocale }, publication.error, '实体稿没有重新发布', 'The manuscript was not published again.')
+      }
+    }
+    if (!saved?.postProcessComplete) {
+      const project = useProjectStore.getState().currentProject
+      if (!project) throw new Error('GENERATION_BATCH_PROJECT_REQUIRED')
+      await new RunFinalizePostProcessCommand({
+        project, chapterNumber, chapterTitle: chapterInfo.title, draftContent, draftId: saved!.draftId,
+        finalizedSource: { draftId: saved!.draftId, chapterNumber, finalizationId: existingFinalizationId, contentHash: saved!.contentHash },
+        sourceLabel: localeText(uiLocale, `第${chapterNumber}章定稿`, `Chapter ${chapterNumber} finalization`),
+        stopOnFailure: true, chapterEntities: chapterInfo.characters,
+      }).execute({ step, context, callbacks })
+    }
+  } else await new FinalizeChapterCommand({
+    draftPath,
+    draftContent,
+    chapterNumber,
+    chapterInfo,
+    stopOnPostProcessFailure: true,
+    eventSource: 'batch',
+    ...(snapshot ? { snapshot } : {}),
+  }).execute({ step, context, callbacks })
+
+  const finalized = await ipc.invokeWithProjectSession(projectSession, 'generation:read-batch', { batchId: progress.batchId })
+  const finalizationId = finalized.completedChapters.find(item => item.chapterNumber === chapterNumber)?.finalizationId
+  if (!finalizationId) throw new Error('GENERATION_BATCH_FINALIZATION_RECEIPT_REQUIRED')
+  await ipc.invokeWithProjectSession(projectSession, 'generation:confirm-batch-finalization', {
+    batchId: progress.batchId, chapterNumber, finalizationId,
+  })
+
+  callbacks.setProgress(100)
+  return localeText(
+    uiLocale,
+    `第${chapterNumber}章已定稿，后处理全部通过。`,
+    `Chapter ${chapterNumber} was finalized and all post-processing passed.`,
+  )
+}
+
+/**
+ * 受控批量创作：每个步骤完整处理一章。
+ *
+ * 工作流层只会在章节边界推进；因此暂停/取消不会将一个正在进行的模型请求或后处理
+ * 截断到不一致状态。后处理任一步骤最终失败会抛出错误，阻止后续章节启动。
+ */
+export function createBatchChapterWorkflow(params: BatchChapterWorkflowParams): BatchChapterWorkflowDefinition {
+  const uiLocale: Locale = params.locale === 'en-US' ? 'en-US' : 'zh-CN'
+  if (!sameProjectPathKey(params.projectSession.projectPath, params.projectPath)) {
+    throw new Error(localeText(uiLocale, '批量创作项目会话与目标路径不匹配', 'The batch-writing project session does not match the target path.'))
+  }
+  const projectPath = params.projectPath
+  const startChapterNumber = Math.max(1, Math.trunc(Number(params.startChapterNumber) || 1))
+  const chapterCount = normalizeBatchChapterCount(params.chapterCount)
+  const generationModelId = normalizeGenerationModelId(params.generationModelId)
+  if (!generationModelId) {
+    throw new Error(localeText(
+      uiLocale,
+      '批量创作必须冻结一项可用的生成模型。',
+      'Batch writing requires a frozen generation model.',
+    ))
+  }
+  const completionMode = normalizeCompletionMode(params.completionMode)
+  const chapterWordsTarget = normalizeChapterWordsTarget(params.chapterWordsTarget)
+  const endChapterNumber = startChapterNumber + chapterCount - 1
+  const batchState = { batchId: params.resumeBatchId, params }
+  const chapterResourceKeys = Array.from({ length: chapterCount }, (_, index) => (
+    workflowResourceKey('chapter', startChapterNumber + index)
+  ))
+  const [modeZh, modeEn] = completionMode === 'draft_review' ? ['批量草稿待审', 'Batch review drafts'] : ['批量自动定稿', 'Batch auto-finalize']
+  const [rangeZh, rangeEn] = chapterCount === 1
+    ? [`第 ${startChapterNumber} 章`, `Chapter ${startChapterNumber}`]
+    : [`第 ${startChapterNumber} 至 ${endChapterNumber} 章`, `Chapters ${startChapterNumber}–${endChapterNumber}`]
+
+  return {
+    type: 'batch_generate',
+    projectPath,
+    projectSession: Object.freeze({ ...params.projectSession }),
+    generationModelId,
+    chapterWordsTarget,
+    resourceKeys: completionMode === 'auto_finalize'
+      ? [
+          ...chapterResourceKeys,
+          ...FINALIZATION_SHARED_WRITE_RESOURCE_KINDS.map(kind => workflowResourceKey(kind)),
+        ]
+      : chapterResourceKeys,
+    readResourceKeys: [
+      workflowResourceKey('novel-config'),
+      workflowResourceKey('architecture'),
+      workflowResourceKey('blueprints'),
+    ],
+    completionMode,
+    title: localeText(uiLocale, `${modeZh} · ${rangeZh}`, `${modeEn} · ${rangeEn}`),
+    steps: Array.from({ length: chapterCount }, (_, index) => {
+      const chapterNumber = startChapterNumber + index
+      return {
+        name: completionMode === 'draft_review'
+          ? localeText(
+            uiLocale,
+            `第 ${chapterNumber} 章 · 生成草稿待审`,
+            `Chapter ${chapterNumber} · Generate review draft`,
+          )
+          : localeText(
+            uiLocale,
+            `第 ${chapterNumber} 章 · 自动定稿与后处理`,
+            `Chapter ${chapterNumber} · Auto-finalize and post-process`,
+          ),
+        description: completionMode === 'draft_review'
+          ? localeText(
+            uiLocale,
+            '按蓝图生成可编辑草稿并保留待审；不定稿或运行后处理。',
+            'Generate an editable draft from the blueprint and keep it for review without finalizing or post-processing.',
+          )
+          : localeText(
+            uiLocale,
+            '按蓝图生成草稿并自动定稿；任一后处理失败立即停止。',
+            'Generate from the blueprint, finalize automatically, and stop immediately if post-processing fails.',
+          ),
+        executor: (step, context, callbacks) => runOneBatchChapter(
+          projectPath,
+          startChapterNumber,
+          chapterNumber,
+          chapterWordsTarget,
+          completionMode,
+          uiLocale,
+          step,
+          context,
+          callbacks,
+          batchState,
+        ),
+      }
+    }),
+    onComplete: { mode: 'silent' },
+  }
+}

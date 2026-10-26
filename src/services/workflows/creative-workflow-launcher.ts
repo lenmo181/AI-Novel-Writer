@@ -1,0 +1,276 @@
+import { displayedErrorMessage } from '../../i18n/app-errors'
+import type { ProjectSessionContext } from '../../shared/ipc-channels'
+import { projectSessionContextFromProject, sameProjectSessionContext } from '../../shared/project-session-context'
+import { randomUUID } from '../../utils/id'
+import { useProjectStore } from '../../stores/project-store'
+import {
+  useWorkflowStore,
+  workflowResourceConflictMessage,
+  type WorkflowDefinition,
+  type WorkflowStatus,
+} from '../../stores/workflow-store'
+import { useLocaleStore } from '../../stores/locale-store'
+import { ipc } from '../ipc-client'
+import {
+  guardArchitectureGeneration,
+  guardChapterWriting,
+  guardDirectoryGeneration,
+  type GuardResult,
+} from '../workflow-guards'
+import { createArchitectureWorkflow, type ArchitectureWorkflowParams } from './architecture-workflow'
+import { createChapterWorkflow } from './chapter-workflow'
+import { createDirectoryWorkflow, type DirectoryWorkflowParams } from './directory-workflow'
+import { normalizeChapterWordsTarget } from './chapter-creation-parameters'
+import type { Locale } from '../../i18n/types'
+import { localize } from '../../i18n/core'
+import type { AgentToolActionRef } from '../../shared/agent-generation'
+
+export type CreativeWorkflowName =
+  | 'generate_draft'
+  | 'review'
+  | 'refine'
+  | 'finalize'
+  | 'generate_blueprint'
+  | 'generate_architecture'
+
+export type CreativeIntent =
+  | { workflow: 'generate_draft'; chapterNumber: number }
+  | {
+      workflow: 'generate_architecture'
+      targetUnits?: number
+      selectedSteps?: ArchitectureWorkflowParams['selectedSteps']
+      stepGuidance?: Record<string, string>
+      /** 情节大纲本次生成范围 [from..to]（缺省 = 第 1 章到全书）。 */
+      synopsisRange?: ArchitectureWorkflowParams['synopsisRange']
+      /** 从输出长度中断的检查点续写情节大纲。 */
+      resumeSynopsis?: ArchitectureWorkflowParams['resumeSynopsis']
+      /** 从输出长度中断的候选续写世界观。 */
+      resumeWorldBuilding?: ArchitectureWorkflowParams['resumeWorldBuilding']
+      /** 完成本批后自动排队下一批，直到覆盖全书。 */
+      autoContinueSynopsis?: ArchitectureWorkflowParams['autoContinueSynopsis']
+      expectedRecoveryHandle?: ArchitectureWorkflowParams['expectedRecoveryHandle']
+    }
+  | { workflow: 'generate_blueprint'; params?: DirectoryWorkflowParams }
+  | { workflow: 'review' | 'refine' | 'finalize'; chapterNumber: number }
+
+export interface CreativeWorkflowLaunchReceipt {
+  readonly accepted: true
+  readonly workflow: CreativeWorkflowName
+  readonly projectPath: string
+  readonly projectSession: ProjectSessionContext
+  readonly runId: string
+  readonly status: WorkflowStatus
+}
+
+/**
+ * A renderer-owned model choice may accompany an Agent-originated draft run.
+ * It is intentionally not part of CreativeIntent, which is built from LLM
+ * tool arguments.
+ */
+export interface CreativeWorkflowLaunchOptions {
+  readonly agentToolAction?: AgentToolActionRef
+  readonly generationModelId?: string
+  /** Last caller-owned cancellation gate before authoritative registration. */
+  readonly assertActive?: () => void
+  /** Called only after the workflow run is visible in the authoritative store. */
+  readonly onRegistered?: () => void
+}
+
+function requireGuardAccepted(result: GuardResult, uiLocale: Locale): void {
+  if (!result.ok) {
+    throw new Error(result.message ?? localize(uiLocale, '创作工作流前置条件未满足', 'Creative workflow prerequisites are not satisfied'))
+  }
+}
+
+async function guardIntent(
+  intent: CreativeIntent,
+  projectSession: ProjectSessionContext,
+  uiLocale: Locale,
+): Promise<void> {
+  if (intent.workflow === 'generate_architecture') {
+    requireGuardAccepted(
+      guardArchitectureGeneration(projectSession.projectPath, projectSession, uiLocale),
+      uiLocale,
+    )
+    return
+  }
+  if (intent.workflow === 'generate_blueprint') {
+    requireGuardAccepted(
+      await guardDirectoryGeneration(projectSession.projectPath, projectSession, uiLocale),
+      uiLocale,
+    )
+    return
+  }
+  if (intent.workflow === 'generate_draft') {
+    requireGuardAccepted(
+      await guardChapterWriting(intent.chapterNumber, projectSession.projectPath, projectSession, uiLocale),
+      uiLocale,
+    )
+  }
+}
+
+function currentProjectFor(projectSession: ProjectSessionContext, uiLocale: Locale) {
+  const project = useProjectStore.getState().currentProject
+  if (!project || !sameProjectSessionContext(projectSession, projectSessionContextFromProject(project))) {
+    throw new Error(localize(uiLocale, '当前项目会话已切换，工作流未启动', 'The project session changed, so the workflow did not start.'))
+  }
+  return project
+}
+
+async function definitionFor(
+  intent: CreativeIntent,
+  projectSession: ProjectSessionContext,
+  generationModelId: string | undefined,
+  uiLocale: Locale,
+): Promise<WorkflowDefinition> {
+  const project = currentProjectFor(projectSession, uiLocale)
+
+  if (intent.workflow === 'generate_architecture') {
+    const includesSynopsis = intent.selectedSteps === undefined || intent.selectedSteps.includes('synopsis')
+    const autoContinueSynopsis = intent.autoContinueSynopsis
+      ?? (includesSynopsis && !intent.resumeWorldBuilding)
+    return createArchitectureWorkflow({
+      projectPath: project.path,
+      projectSession,
+      targetUnits: intent.targetUnits,
+      selectedSteps: intent.selectedSteps,
+      stepGuidance: intent.stepGuidance,
+      synopsisRange: intent.synopsisRange ?? null,
+      resumeSynopsis: intent.resumeSynopsis,
+      resumeWorldBuilding: intent.resumeWorldBuilding,
+      autoContinueSynopsis,
+      expectedRecoveryHandle: intent.expectedRecoveryHandle,
+    }, uiLocale)
+  }
+  if (intent.workflow === 'generate_blueprint') {
+    return createDirectoryWorkflow(intent.params ?? { mode: 'full' }, project.path, projectSession, uiLocale)
+  }
+  if (intent.workflow === 'generate_draft') {
+    if (!Number.isInteger(intent.chapterNumber) || intent.chapterNumber < 1) {
+      throw new Error(localize(uiLocale, '写稿需要有效的 chapter_number（从 1 开始）', 'Drafting needs a valid chapter_number (starting from 1).'))
+    }
+    const blueprint = await ipc.invokeWithProjectSession(
+      projectSession,
+      'db:blueprint-get',
+      intent.chapterNumber,
+      project.path,
+    )
+    currentProjectFor(projectSession, uiLocale)
+    if (!blueprint) {
+      throw new Error(localize(
+        uiLocale,
+        `第 ${intent.chapterNumber} 章蓝图不存在；请先运行 generate_blueprint 工作流`,
+        `Chapter ${intent.chapterNumber} has no blueprint. Run the generate_blueprint workflow first.`,
+      ))
+    }
+    return createChapterWorkflow({
+      projectPath: project.path,
+      chapterNumber: blueprint.chapterNumber,
+      title: blueprint.title,
+      role: blueprint.role,
+      purpose: blueprint.purpose,
+      characters: blueprint.characters,
+      keyEvents: blueprint.keyEvents,
+      suspenseHook: blueprint.suspenseHook,
+      userGuidance: blueprint.userGuidance,
+      wordsTarget: normalizeChapterWordsTarget(project.novelConfig.wordsPerChapter),
+    }, projectSession, { generationModelId, uiLocale })
+  }
+
+  throw new Error(localize(
+    uiLocale,
+    `${intent.workflow} 需要明确的草稿 ID 和不可变正文快照；请先打开目标草稿后从编辑器启动`,
+    `${intent.workflow} needs an explicit draft ID and a fixed snapshot of its text. Open the target draft and start it from the editor.`,
+  ))
+}
+
+/** The sole seam for turning a creative intent into an observable workflow run. */
+export async function launchCreativeWorkflow(
+  intent: CreativeIntent,
+  projectSession: ProjectSessionContext,
+  options: CreativeWorkflowLaunchOptions = {},
+): Promise<CreativeWorkflowLaunchReceipt> {
+  let generationModelId = options.generationModelId?.trim() || undefined
+  const uiLocale = useLocaleStore.getState().locale
+  currentProjectFor(projectSession, uiLocale)
+  const registration = options.agentToolAction ? await ipc.invokeWithProjectSession(projectSession, 'agent-generation:register-workflow', { ref: options.agentToolAction }) : undefined
+  if (registration) {
+    if (intent.workflow !== registration.workflow || intent.workflow === 'generate_draft' && intent.chapterNumber !== registration.chapterNumber
+      || generationModelId && generationModelId !== registration.modelId) throw new Error('GENERATION_AGENT_WORKFLOW_INTENT_CHANGED')
+    generationModelId = registration.modelId
+    if (registration.planning) {
+      const { from, to, targetUnits } = registration.planning
+      if (intent.workflow === 'generate_architecture') intent = { ...intent, synopsisRange: { from, to }, targetUnits }
+      else if (intent.workflow === 'generate_blueprint') intent = { ...intent, params: { mode: 'append', startChapter: from, count: to - from + 1, targetUnits } }
+    }
+    const state = useWorkflowStore.getState()
+    const existing = state.activeRuns.find(run => run.id === registration.registrationId) ?? state.history.find(run => run.id === registration.registrationId)
+    if (existing || registration.childHandles.length) {
+      if (existing && !sameProjectSessionContext(existing.projectSession, projectSession)) throw new Error('GENERATION_AGENT_WORKFLOW_RECOVERY_REQUIRED')
+      return Object.freeze({ accepted: true, workflow: registration.workflow, projectPath: projectSession.projectPath,
+        projectSession: Object.freeze({ ...projectSession }), runId: registration.registrationId, status: existing?.status ?? 'waiting' })
+    }
+  }
+  await guardIntent(intent, projectSession, uiLocale)
+  currentProjectFor(projectSession, uiLocale)
+  const definition = await definitionFor(
+    intent,
+    Object.freeze({ ...projectSession }),
+    generationModelId,
+    uiLocale,
+  )
+  currentProjectFor(projectSession, uiLocale)
+
+  // Definition loading can yield. A concurrent replay may have registered the
+  // same main-issued workflow while this caller was awaiting its definition.
+  if (registration) {
+    const state = useWorkflowStore.getState()
+    const existing = state.activeRuns.find(run => run.id === registration.registrationId) ?? state.history.find(run => run.id === registration.registrationId)
+    if (existing) {
+      if (!sameProjectSessionContext(existing.projectSession, projectSession)) throw new Error('GENERATION_AGENT_WORKFLOW_RECOVERY_REQUIRED')
+      return Object.freeze({ accepted: true, workflow: registration.workflow, projectPath: projectSession.projectPath,
+        projectSession: Object.freeze({ ...projectSession }), runId: registration.registrationId, status: existing.status })
+    }
+  }
+  const conflict = useWorkflowStore.getState().getResourceConflict(definition)
+  if (conflict) {
+    throw new Error(workflowResourceConflictMessage(uiLocale, conflict.title))
+  }
+
+  const runId = registration?.registrationId ?? randomUUID()
+  options.assertActive?.()
+  const completion = useWorkflowStore.getState().startWorkflow({ ...definition, runId, uiLocale,
+    ...(generationModelId ? { generationModelId } : {}), ...(registration ? { agentWorkflowRegistration: registration } : {}) })
+  void completion.catch((error) => {
+    useWorkflowStore.getState().addLog(
+      'error',
+      uiLocale === 'en-US'
+        ? `[Failed] Workflow errored after launch: ${displayedErrorMessage(uiLocale, error)}`
+        : `[失败] 工作流启动后异常：${displayedErrorMessage(uiLocale, error)}`,
+      uiLocale,
+    )
+  })
+
+  const state = useWorkflowStore.getState()
+  const registered = state.activeRuns.find(run => run.id === runId)
+    ?? state.history.find(run => run.id === runId)
+  if (!registered || registered.status === 'failed') {
+    throw new Error(registered?.error ?? localize(
+      uiLocale,
+      '工作流未能注册到任务中心，已拒绝报告启动成功',
+      'The workflow was not registered in the task center, so its launch was not reported as successful.',
+    ))
+  }
+  options.onRegistered?.()
+
+  return Object.freeze({
+    accepted: true,
+    workflow: intent.workflow,
+    projectPath: registered.projectPath,
+    projectSession: Object.freeze({ ...projectSession }),
+    runId: registered.id,
+    status: registered.status,
+  })
+}
+
+export const CreativeWorkflowLauncher = Object.freeze({ launch: launchCreativeWorkflow })

@@ -1,0 +1,810 @@
+/**
+ * BlueprintRepository — 章节蓝图 (blueprints 表)
+ *
+ * 取代旧的 chapter-repository.ts，管理章节的规划元数据。
+ */
+import { createHash } from 'node:crypto'
+
+import { getProjectDb, getCurrentProjectPath } from '../database'
+import { readPortableRuntimeFreeze } from '../services/portable-runtime-freeze'
+import { ensureBaselineBlueprintTables } from '../migrations/baseline-blueprint-schema'
+import { CharacterRosterRepository } from './character-roster-repository'
+import { hasCharacterIdentitySchema } from './character-repository'
+import { findCharacterProposalEvidence } from '../services/character-proposal-service'
+import { proveCharacterProposal } from '../services/generation-character-proposal-proof'
+import { GenerationRunRepository } from './generation-run-repository'
+import { blueprintCharacterSyncFactError } from '../../src/shared/blueprint-character-sync-evidence'
+import type { BlueprintNewCharacterCandidate } from '../../src/shared/blueprint-semantic-contract'
+
+/** 蓝图行类型（DB 蛇形命名） */
+export interface BlueprintRow {
+    chapter_number: number
+    title: string
+    role: string
+    purpose: string
+    key_events: string
+    characters: string
+    suspense_hook: string
+    user_guidance: string
+    notes: string
+    notes_updated_at: string
+    created_at: string
+    updated_at: string
+}
+
+/** 前端使用的驼峰接口 */
+export interface BlueprintData {
+    chapterNumber: number
+    title: string
+    role: string
+    purpose: string
+    keyEvents: string
+    characters: string[]
+    /** Important recurring characters first introduced by this blueprint. */
+    newCharacterCandidates?: BlueprintNewCharacterCandidate[]
+    /**
+     * Relationship payload from the just-generated blueprint. It is not part
+     * of the editable blueprints table; an atomic range commit retains it in
+     * the immutable operation receipt so character sync can be replayed.
+     */
+    relationshipHints?: unknown
+    suspenseHook: string
+    userGuidance: string
+    notes: string
+    notesUpdatedAt: string
+}
+
+export type BlueprintRangeCommitMode = 'full' | 'replace-range'
+
+export interface BlueprintRangeCommitRequest {
+    authorRecovery?: { sourceHandle: import('../../src/services/generation/generation-runtime').MainGenerationRunHandle; leaseEpoch: string }
+    /** Optional while legacy import consumers await S06D/S12; generated planning supplies it. */
+    generationRunHandle?: import('../../src/services/generation/generation-runtime').MainGenerationRunHandle
+    generationRequestedRange?: { startChapter: number; endChapter: number }
+    mode: BlueprintRangeCommitMode
+    operationId: string
+    startChapter: number
+    endChapter: number
+    blueprints: BlueprintData[]
+}
+
+export interface BlueprintRangeCommitReceipt {
+    authorEdit?: import('../../src/shared/generation-owner-contract').BlueprintAuthorEditReceipt
+    generationProgress?: import('../../src/shared/generation-owner-contract').DirectoryGenerationProgress
+    mode: BlueprintRangeCommitMode
+    operationId: string
+    payloadHash: string
+    idempotent: boolean
+    startChapter: number
+    endChapter: number
+    chapterNumbers: number[]
+    snapshot: BlueprintData[]
+    /** Frozen generation facts required to replay character-candidate sync. */
+    characterSyncInput: BlueprintData[]
+    /** Durable post-commit work item; it survives renderer/app restarts. */
+    characterSyncOperation: BlueprintCharacterSyncOperation
+}
+
+export interface BlueprintCharacterSyncCompletionReceipt {
+    blueprintCommitOperationId: string
+    operationId: string
+    status: 'committed' | 'already-satisfied' | 'proposal-staged'
+    proposalReceipt?: import('../../src/shared/character-proposal').CharacterProposalStageEvidence
+    /** Hash/revision evidence only; the authoritative roster snapshot stays in its fact tables. */
+    rosterReceipt?: {
+        operationId: string
+        payloadHash: string
+        revision: number
+        idempotent: boolean
+    }
+}
+
+export interface BlueprintCharacterSyncOperation {
+    operationId: string
+    blueprintCommitOperationId: string
+    blueprintCommitPayloadHash: string
+    status: 'pending' | 'completed'
+    startChapter: number
+    endChapter: number
+    characterSyncInput: BlueprintData[]
+    completionReceipt?: BlueprintCharacterSyncCompletionReceipt
+    createdAt: string
+    updatedAt: string
+    completedAt?: string
+}
+
+interface BlueprintCommitOperationRow {
+    operation_id: string
+    payload_hash: string
+    mode: BlueprintRangeCommitMode
+    start_chapter: number
+    end_chapter: number
+    character_sync_input: string
+}
+
+interface BlueprintCharacterSyncOperationRow {
+    operation_id: string
+    blueprint_commit_operation_id: string
+    blueprint_commit_payload_hash: string
+    status: 'pending' | 'completed'
+    start_chapter: number
+    end_chapter: number
+    character_sync_input: string
+    completion_receipt: string | null
+    created_at: string
+    updated_at: string
+    completed_at: string | null
+}
+
+interface CharacterRosterOperationEvidenceRow {
+    operation_id: string
+    payload_hash: string
+    committed_revision: number
+    projection_hash: string
+}
+
+const SHA256_HEX = /^[a-f0-9]{64}$/u
+
+function rowToData(row: BlueprintRow): BlueprintData {
+    let chars: string[] = []
+    try { chars = JSON.parse(row.characters) } catch { /* 容错 */ }
+    return {
+        chapterNumber: row.chapter_number,
+        title: row.title,
+        role: row.role,
+        purpose: row.purpose,
+        keyEvents: row.key_events,
+        characters: chars,
+        suspenseHook: row.suspense_hook,
+        userGuidance: row.user_guidance,
+        notes: row.notes,
+        notesUpdatedAt: row.notes_updated_at,
+    }
+}
+
+function requireProjectDb(): NonNullable<ReturnType<typeof getProjectDb>> {
+    const db = getProjectDb()
+    if (!db) throw new Error('PROJECT_NOT_OPEN')
+    return db
+}
+
+function ensureBlueprintCommitSchema(db: NonNullable<ReturnType<typeof getProjectDb>>): void {
+    ensureBaselineBlueprintTables(db)
+    db.exec(`
+      INSERT OR IGNORE INTO blueprint_character_sync_operations (
+        operation_id,
+        blueprint_commit_operation_id,
+        blueprint_commit_payload_hash,
+        start_chapter,
+        end_chapter,
+        character_sync_input
+      )
+      SELECT
+        'blueprint-sync-' || operation_id,
+        operation_id,
+        payload_hash,
+        start_chapter,
+        end_chapter,
+        character_sync_input
+      FROM blueprint_commit_operations;
+    `)
+}
+
+/** Caller owns the surrounding transaction when composing a multi-fact project clear. */
+export function clearBlueprintFactsWithinTransaction(
+    db: NonNullable<ReturnType<typeof getProjectDb>>,
+): void {
+    ensureBlueprintCommitSchema(db)
+    if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='generation_runs'").get()) {
+        const freeze = readPortableRuntimeFreeze(getCurrentProjectPath())
+        new GenerationRunRepository(() => db, Date.now, (table, recordId) => freeze.isFrozen(table, recordId)).retireBlueprintRecoveryWithinTransaction()
+    }
+    db.prepare('DELETE FROM blueprint_character_sync_operations').run()
+    db.prepare('DELETE FROM blueprint_commit_operations').run()
+    db.prepare('DELETE FROM blueprints').run()
+}
+
+function characterSyncOperationId(blueprintCommitOperationId: string): string {
+    return `blueprint-sync-${blueprintCommitOperationId}`
+}
+
+function canonicalize(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(canonicalize)
+    if (!value || typeof value !== 'object') return value
+    return Object.fromEntries(
+        Object.entries(value as Record<string, unknown>)
+            .filter(([, entry]) => entry !== undefined)
+            .sort(([left], [right]) => left.localeCompare(right, 'en-US'))
+            .map(([key, entry]) => [key, canonicalize(entry)]),
+    )
+}
+
+function commitPayloadHash(request: BlueprintRangeCommitRequest): string {
+    return createHash('sha256').update(JSON.stringify(canonicalize({
+        mode: request.mode,
+        startChapter: request.startChapter,
+        endChapter: request.endChapter,
+        blueprints: request.blueprints,
+    }))).digest('hex')
+}
+
+function assertExactRange(request: BlueprintRangeCommitRequest): void {
+    const { operationId, startChapter, endChapter, blueprints } = request
+    if (!operationId.trim()) throw new Error('BLUEPRINT_OPERATION_ID_REQUIRED')
+    if (request.mode !== 'full' && request.mode !== 'replace-range') {
+        throw new Error('BLUEPRINT_COMMIT_MODE_INVALID')
+    }
+    if (
+        !Number.isInteger(startChapter)
+        || !Number.isInteger(endChapter)
+        || startChapter < 1
+        || endChapter < startChapter
+    ) {
+        throw new Error('BLUEPRINT_COMMIT_RANGE_INVALID')
+    }
+    if (request.mode === 'full' && startChapter !== 1) {
+        throw new Error('BLUEPRINT_COMMIT_RANGE_INVALID')
+    }
+
+    const expectedNumbers = Array.from(
+        { length: endChapter - startChapter + 1 },
+        (_, index) => startChapter + index,
+    )
+    const actualNumbers = blueprints.map(item => item.chapterNumber)
+    if (
+        actualNumbers.length !== expectedNumbers.length
+        || new Set(actualNumbers).size !== actualNumbers.length
+        || expectedNumbers.some(chapterNumber => !actualNumbers.includes(chapterNumber))
+    ) {
+        throw new Error('BLUEPRINT_COMMIT_RANGE_INCOMPLETE')
+    }
+}
+
+function readExactRange(
+    db: NonNullable<ReturnType<typeof getProjectDb>>,
+    request: Pick<BlueprintRangeCommitRequest, 'mode' | 'operationId' | 'startChapter' | 'endChapter'>,
+): BlueprintData[] {
+    const rows = db.prepare(`
+      SELECT * FROM blueprints
+      WHERE chapter_number BETWEEN ? AND ?
+      ORDER BY chapter_number ASC
+    `).all(request.startChapter, request.endChapter) as BlueprintRow[]
+    const snapshot = rows.map(rowToData)
+    assertExactRange({ ...request, blueprints: snapshot })
+    return snapshot
+}
+
+function readCharacterSyncInput(row: BlueprintCommitOperationRow): BlueprintData[] {
+    let parsed: unknown
+    try {
+        parsed = JSON.parse(row.character_sync_input)
+    } catch {
+        throw new Error('BLUEPRINT_COMMIT_RECEIPT_INVALID')
+    }
+    if (!Array.isArray(parsed)) throw new Error('BLUEPRINT_COMMIT_RECEIPT_INVALID')
+    return parsed as BlueprintData[]
+}
+
+function parseCharacterSyncInput(serialized: string): BlueprintData[] {
+    let parsed: unknown
+    try {
+        parsed = JSON.parse(serialized)
+    } catch {
+        throw new Error('BLUEPRINT_CHARACTER_SYNC_INPUT_INVALID')
+    }
+    if (!Array.isArray(parsed)) throw new Error('BLUEPRINT_CHARACTER_SYNC_INPUT_INVALID')
+    return parsed as BlueprintData[]
+}
+
+function parseCompletionReceipt(
+    serialized: string | null,
+): BlueprintCharacterSyncCompletionReceipt | undefined {
+    if (serialized === null) return undefined
+    let parsed: unknown
+    try {
+        parsed = JSON.parse(serialized)
+    } catch {
+        throw new Error('BLUEPRINT_CHARACTER_SYNC_RECEIPT_INVALID')
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('BLUEPRINT_CHARACTER_SYNC_RECEIPT_INVALID')
+    }
+    return parsed as BlueprintCharacterSyncCompletionReceipt
+}
+
+function rowToCharacterSyncOperation(
+    row: BlueprintCharacterSyncOperationRow,
+): BlueprintCharacterSyncOperation {
+    const completionReceipt = parseCompletionReceipt(row.completion_receipt)
+    if (row.status === 'pending' && completionReceipt) {
+        throw new Error('BLUEPRINT_CHARACTER_SYNC_STATE_INVALID')
+    }
+    if (row.status === 'completed' && !completionReceipt) {
+        throw new Error('BLUEPRINT_CHARACTER_SYNC_STATE_INVALID')
+    }
+    return {
+        operationId: row.operation_id,
+        blueprintCommitOperationId: row.blueprint_commit_operation_id,
+        blueprintCommitPayloadHash: row.blueprint_commit_payload_hash,
+        status: row.status,
+        startChapter: row.start_chapter,
+        endChapter: row.end_chapter,
+        characterSyncInput: parseCharacterSyncInput(row.character_sync_input),
+        ...(completionReceipt ? { completionReceipt } : {}),
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        ...(row.completed_at ? { completedAt: row.completed_at } : {}),
+    }
+}
+
+function readCharacterSyncOperation(
+    db: NonNullable<ReturnType<typeof getProjectDb>>,
+    operationId: string,
+): BlueprintCharacterSyncOperation | null {
+    const row = db.prepare(`
+      SELECT
+        operation_id,
+        blueprint_commit_operation_id,
+        blueprint_commit_payload_hash,
+        status,
+        start_chapter,
+        end_chapter,
+        character_sync_input,
+        completion_receipt,
+        created_at,
+        updated_at,
+        completed_at
+      FROM blueprint_character_sync_operations
+      WHERE operation_id = ?
+    `).get(operationId) as BlueprintCharacterSyncOperationRow | undefined
+    return row ? rowToCharacterSyncOperation(row) : null
+}
+
+function authoritativeCharacterSyncCompletionReceipt(
+    db: NonNullable<ReturnType<typeof getProjectDb>>,
+    operation: BlueprintCharacterSyncOperation,
+): BlueprintCharacterSyncCompletionReceipt {
+    if (hasCharacterIdentitySchema(db)) {
+        const proposalReceipt = findCharacterProposalEvidence(db, { kind: 'directory', operationId: operation.operationId },
+          (projectId, source) => proveCharacterProposal(db, new GenerationRunRepository(() => db), projectId, source, false, () => {}))
+        return { blueprintCommitOperationId: operation.blueprintCommitOperationId, operationId: operation.operationId, status: 'proposal-staged', proposalReceipt }
+    }
+    const roster = CharacterRosterRepository.read()
+    if (roster.status !== 'ready' && roster.status !== 'empty') {
+        throw new Error('BLUEPRINT_CHARACTER_SYNC_ROSTER_NOT_READY')
+    }
+    const factError = blueprintCharacterSyncFactError(operation.characterSyncInput, roster.entries)
+    if (factError) throw new Error('BLUEPRINT_CHARACTER_SYNC_FACTS_CHANGED')
+
+    const rosterOperation = db.prepare(`
+      SELECT operation_id, payload_hash, committed_revision, projection_hash
+      FROM character_roster_operations
+      WHERE operation_id = ?
+    `).get(operation.operationId) as CharacterRosterOperationEvidenceRow | undefined
+    if (!rosterOperation) {
+        return {
+            blueprintCommitOperationId: operation.blueprintCommitOperationId,
+            operationId: operation.operationId,
+            status: 'already-satisfied',
+        }
+    }
+    if (
+        rosterOperation.operation_id !== operation.operationId
+        || rosterOperation.committed_revision < 1
+        || rosterOperation.committed_revision > roster.revision
+        || !SHA256_HEX.test(rosterOperation.payload_hash)
+        || !SHA256_HEX.test(rosterOperation.projection_hash)
+        || (
+            rosterOperation.committed_revision === roster.revision
+            && rosterOperation.projection_hash !== roster.projectionHash
+        )
+    ) {
+        throw new Error('BLUEPRINT_CHARACTER_SYNC_EVIDENCE_MISMATCH')
+    }
+    return {
+        blueprintCommitOperationId: operation.blueprintCommitOperationId,
+        operationId: operation.operationId,
+        status: 'committed',
+        rosterReceipt: {
+            operationId: rosterOperation.operation_id,
+            payloadHash: rosterOperation.payload_hash,
+            revision: rosterOperation.committed_revision,
+            idempotent: false,
+        },
+    }
+}
+
+function assertAuthoritativeCharacterSyncCompletion(
+    db: NonNullable<ReturnType<typeof getProjectDb>>,
+    operation: BlueprintCharacterSyncOperation,
+): void {
+    if (operation.status !== 'completed' || !operation.completionReceipt) return
+    const authoritative = authoritativeCharacterSyncCompletionReceipt(db, operation)
+    if (
+        JSON.stringify(canonicalize(operation.completionReceipt))
+        !== JSON.stringify(canonicalize(authoritative))
+    ) {
+        throw new Error('BLUEPRINT_CHARACTER_SYNC_RECEIPT_MISMATCH')
+    }
+}
+
+function snapshotWithCharacterSyncFacts(
+    persisted: readonly BlueprintData[],
+    characterSyncInput: readonly BlueprintData[],
+): BlueprintData[] {
+    const inputByChapter = new Map(
+        characterSyncInput.map(blueprint => [blueprint.chapterNumber, blueprint] as const),
+    )
+    return persisted.map((blueprint) => {
+        const input = inputByChapter.get(blueprint.chapterNumber)
+        if (!input) return blueprint
+        return {
+            ...blueprint,
+            ...(input.relationshipHints === undefined ? {} : { relationshipHints: input.relationshipHints }),
+            ...(input.newCharacterCandidates === undefined
+                ? {}
+                : { newCharacterCandidates: input.newCharacterCandidates }),
+        }
+    })
+}
+
+const AUTHOR_FIELD_GROUPS = [
+    { content: 'userGuidance', companions: [] },
+    { content: 'notes', companions: ['notesUpdatedAt'] },
+] as const
+
+function withExistingAuthorFields(blueprint: BlueprintData, existing: BlueprintData | undefined): BlueprintData {
+    const authorFields = AUTHOR_FIELD_GROUPS.flatMap(({ content, companions }) => {
+        const source = blueprint[content] ? blueprint : existing
+        return [content, ...companions].map(key => [key, source?.[key] || ''] as const)
+    })
+    return { ...blueprint, ...Object.fromEntries(authorFields) }
+}
+
+function samePersistedBlueprint(left: BlueprintData, right: BlueprintData): boolean {
+    return left.chapterNumber === right.chapterNumber
+        && left.title === right.title
+        && left.role === right.role
+        && left.purpose === right.purpose
+        && left.keyEvents === right.keyEvents
+        && JSON.stringify(left.characters) === JSON.stringify(right.characters)
+        && left.suspenseHook === right.suspenseHook
+        && left.userGuidance === right.userGuidance
+        && left.notes === right.notes
+        && left.notesUpdatedAt === right.notesUpdatedAt
+}
+
+export class BlueprintRepository {
+    /** 获取所有蓝图（按章节号排序） */
+    static getAll(db = requireProjectDb()): BlueprintData[] {
+
+        const rows = db.prepare(
+            'SELECT * FROM blueprints ORDER BY chapter_number ASC'
+        ).all() as BlueprintRow[]
+
+        return rows.map(rowToData)
+    }
+
+    /** 获取单个蓝图 */
+    static getByChapter(chapterNumber: number): BlueprintData | null {
+        const db = requireProjectDb()
+
+        const row = db.prepare(
+            'SELECT * FROM blueprints WHERE chapter_number = ?'
+        ).get(chapterNumber) as BlueprintRow | undefined
+
+        return row ? rowToData(row) : null
+    }
+
+    /** 获取蓝图总数 */
+    static count(): number {
+        const db = requireProjectDb()
+
+        const row = db.prepare(
+            'SELECT COUNT(*) as cnt FROM blueprints'
+        ).get() as { cnt: number }
+
+        return row.cnt
+    }
+
+    /** 插入或更新蓝图 */
+    static upsert(data: BlueprintData, db = requireProjectDb()): void {
+
+        db.prepare(`
+      INSERT INTO blueprints (
+        chapter_number, title, role, purpose, key_events, characters,
+        suspense_hook, user_guidance, notes, notes_updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(chapter_number) DO UPDATE SET
+        title = excluded.title,
+        role = excluded.role,
+        purpose = excluded.purpose,
+        key_events = excluded.key_events,
+        characters = excluded.characters,
+        suspense_hook = excluded.suspense_hook,
+        user_guidance = excluded.user_guidance,
+        notes = excluded.notes,
+        notes_updated_at = excluded.notes_updated_at,
+        updated_at = datetime('now')
+    `).run(
+            data.chapterNumber,
+            data.title,
+            data.role,
+            data.purpose,
+            data.keyEvents,
+            JSON.stringify(data.characters),
+            data.suspenseHook,
+            data.userGuidance,
+            data.notes,
+            data.notesUpdatedAt,
+        )
+    }
+
+    /** 批量插入/更新蓝图（事务） */
+    static upsertMany(items: BlueprintData[]): void {
+        const db = requireProjectDb()
+
+        const tx = db.transaction(() => {
+            for (const item of items) {
+                BlueprintRepository.upsert(item)
+            }
+        })
+        tx()
+    }
+
+    /** Pure read-back of the operation ledger and its currently bound range/sync evidence. */
+    static getCommittedRangeOperation(operationId: string, db = requireProjectDb()): BlueprintRangeCommitReceipt | null {
+        if (!operationId.trim()) throw new Error('BLUEPRINT_OPERATION_ID_REQUIRED')
+        ensureBlueprintCommitSchema(db)
+        const operation = db.prepare(`
+          SELECT operation_id, payload_hash, mode, start_chapter, end_chapter, character_sync_input
+          FROM blueprint_commit_operations
+          WHERE operation_id = ?
+        `).get(operationId) as BlueprintCommitOperationRow | undefined
+        if (!operation) return null
+        const characterSyncInput = readCharacterSyncInput(operation)
+        const persisted = readExactRange(db, {
+            mode: operation.mode,
+            operationId: operation.operation_id,
+            startChapter: operation.start_chapter,
+            endChapter: operation.end_chapter,
+        })
+        const snapshot = snapshotWithCharacterSyncFacts(persisted, characterSyncInput)
+        const characterSyncOperation = readCharacterSyncOperation(
+            db,
+            characterSyncOperationId(operation.operation_id),
+        )
+        if (!characterSyncOperation) throw new Error('BLUEPRINT_CHARACTER_SYNC_OPERATION_MISSING')
+        assertAuthoritativeCharacterSyncCompletion(db, characterSyncOperation)
+        return {
+            mode: operation.mode,
+            operationId: operation.operation_id,
+            payloadHash: operation.payload_hash,
+            idempotent: false,
+            startChapter: operation.start_chapter,
+            endChapter: operation.end_chapter,
+            chapterNumbers: snapshot.map(blueprint => blueprint.chapterNumber),
+            snapshot,
+            characterSyncInput,
+            characterSyncOperation,
+        }
+    }
+
+    /** 完整逻辑范围只提交一次，并在同一事务内回读验证后返回收据。 */
+    static commitRange(request: BlueprintRangeCommitRequest, assertGenerationSources?: () => void, db = requireProjectDb()): BlueprintRangeCommitReceipt {
+        assertExactRange(request)
+        ensureBlueprintCommitSchema(db)
+        const payloadHash = commitPayloadHash(request)
+        const tx = db.transaction(() => {
+            const existingOperation = db.prepare(`
+              SELECT operation_id, payload_hash, mode, start_chapter, end_chapter, character_sync_input
+              FROM blueprint_commit_operations
+              WHERE operation_id = ?
+            `).get(request.operationId) as BlueprintCommitOperationRow | undefined
+            if (existingOperation) {
+                if (existingOperation.payload_hash !== payloadHash) {
+                    throw new Error('BLUEPRINT_OPERATION_CONFLICT')
+                }
+                const characterSyncInput = readCharacterSyncInput(existingOperation)
+                const persisted = readExactRange(db, {
+                    mode: existingOperation.mode,
+                    operationId: existingOperation.operation_id,
+                    startChapter: existingOperation.start_chapter,
+                    endChapter: existingOperation.end_chapter,
+                })
+                const snapshot = snapshotWithCharacterSyncFacts(persisted, characterSyncInput)
+                const characterSyncOperation = readCharacterSyncOperation(
+                    db,
+                    characterSyncOperationId(existingOperation.operation_id),
+                )
+                if (!characterSyncOperation) throw new Error('BLUEPRINT_CHARACTER_SYNC_OPERATION_MISSING')
+                assertAuthoritativeCharacterSyncCompletion(db, characterSyncOperation)
+                return {
+                    mode: existingOperation.mode,
+                    operationId: existingOperation.operation_id,
+                    payloadHash,
+                    idempotent: true,
+                    startChapter: existingOperation.start_chapter,
+                    endChapter: existingOperation.end_chapter,
+                    chapterNumbers: snapshot.map(blueprint => blueprint.chapterNumber),
+                    snapshot,
+                    characterSyncInput,
+                    characterSyncOperation,
+                }
+            }
+
+            // An acknowledged operation is read-only on replay. New effects must
+            // revalidate frozen sources inside this same write transaction.
+            assertGenerationSources?.()
+            if (request.mode === 'full') {
+                db.prepare(
+                    'DELETE FROM blueprints WHERE chapter_number < ? OR chapter_number > ?',
+                ).run(request.startChapter, request.endChapter)
+            }
+            const existingByChapter = new Map((db.prepare(
+                'SELECT * FROM blueprints WHERE chapter_number BETWEEN ? AND ?',
+            ).all(request.startChapter, request.endChapter) as BlueprintRow[]).map(row => [row.chapter_number, rowToData(row)] as const))
+            const blueprints = request.blueprints.map(blueprint => (
+                withExistingAuthorFields(blueprint, existingByChapter.get(blueprint.chapterNumber))
+            ))
+            for (const blueprint of blueprints) {
+                BlueprintRepository.upsert(blueprint, db)
+            }
+
+            const persisted = readExactRange(db, request)
+
+            const expectedByChapter = new Map(
+                blueprints.map(blueprint => [blueprint.chapterNumber, blueprint] as const),
+            )
+            for (const saved of persisted) {
+                const expected = expectedByChapter.get(saved.chapterNumber)
+                if (!expected || !samePersistedBlueprint(saved, expected)) {
+                    throw new Error('BLUEPRINT_COMMIT_READ_BACK_FAILED')
+                }
+            }
+
+            const characterSyncInput = blueprints
+            db.prepare(`
+              INSERT INTO blueprint_commit_operations (
+                operation_id, payload_hash, mode, start_chapter, end_chapter, character_sync_input
+              ) VALUES (?, ?, ?, ?, ?, ?)
+            `).run(
+                request.operationId,
+                payloadHash,
+                request.mode,
+                request.startChapter,
+                request.endChapter,
+                JSON.stringify(characterSyncInput),
+            )
+            const syncOperationId = characterSyncOperationId(request.operationId)
+            db.prepare(`
+              INSERT INTO blueprint_character_sync_operations (
+                operation_id,
+                blueprint_commit_operation_id,
+                blueprint_commit_payload_hash,
+                start_chapter,
+                end_chapter,
+                character_sync_input
+              ) VALUES (?, ?, ?, ?, ?, ?)
+            `).run(
+                syncOperationId,
+                request.operationId,
+                payloadHash,
+                request.startChapter,
+                request.endChapter,
+                JSON.stringify(characterSyncInput),
+            )
+            const snapshot = snapshotWithCharacterSyncFacts(persisted, characterSyncInput)
+            const characterSyncOperation = readCharacterSyncOperation(db, syncOperationId)
+            if (!characterSyncOperation) throw new Error('BLUEPRINT_CHARACTER_SYNC_OPERATION_MISSING')
+
+            return {
+                mode: request.mode,
+                operationId: request.operationId,
+                payloadHash,
+                idempotent: false,
+                startChapter: request.startChapter,
+                endChapter: request.endChapter,
+                chapterNumbers: snapshot.map(blueprint => blueprint.chapterNumber),
+                snapshot,
+                characterSyncInput,
+                characterSyncOperation,
+            }
+        })
+        return tx.immediate()
+    }
+
+    /** Lists durable post-commit work that can be resumed after an app restart. */
+    static listPendingCharacterSyncOperations(): BlueprintCharacterSyncOperation[] {
+        const db = requireProjectDb()
+        ensureBlueprintCommitSchema(db)
+        const rows = db.prepare(`
+          SELECT
+            operation_id,
+            blueprint_commit_operation_id,
+            blueprint_commit_payload_hash,
+            status,
+            start_chapter,
+            end_chapter,
+            character_sync_input,
+            completion_receipt,
+            created_at,
+            updated_at,
+            completed_at
+          FROM blueprint_character_sync_operations
+          WHERE status = 'pending'
+          ORDER BY created_at ASC, operation_id ASC
+        `).all() as BlueprintCharacterSyncOperationRow[]
+        return rows.map(rowToCharacterSyncOperation)
+    }
+
+    static getCharacterSyncOperation(operationId: string): BlueprintCharacterSyncOperation | null {
+        if (!operationId.trim()) throw new Error('BLUEPRINT_CHARACTER_SYNC_OPERATION_ID_REQUIRED')
+        const db = requireProjectDb()
+        ensureBlueprintCommitSchema(db)
+        const operation = readCharacterSyncOperation(db, operationId)
+        if (operation) assertAuthoritativeCharacterSyncCompletion(db, operation)
+        return operation
+    }
+
+    static completeCharacterSyncOperation(
+        operationId: string,
+    ): BlueprintCharacterSyncOperation {
+        if (!operationId.trim()) throw new Error('BLUEPRINT_CHARACTER_SYNC_OPERATION_ID_REQUIRED')
+        const db = requireProjectDb()
+        ensureBlueprintCommitSchema(db)
+        const tx = db.transaction(() => {
+            const operation = readCharacterSyncOperation(db, operationId)
+            if (!operation) throw new Error('BLUEPRINT_CHARACTER_SYNC_OPERATION_MISSING')
+            if (operation.status === 'completed') {
+                assertAuthoritativeCharacterSyncCompletion(db, operation)
+                return operation
+            }
+            const completionReceipt = authoritativeCharacterSyncCompletionReceipt(db, operation)
+            const result = db.prepare(`
+              UPDATE blueprint_character_sync_operations
+              SET
+                status = 'completed',
+                completion_receipt = ?,
+                completed_at = datetime('now'),
+                updated_at = datetime('now')
+              WHERE operation_id = ? AND status = 'pending'
+            `).run(JSON.stringify(canonicalize(completionReceipt)), operationId)
+            if (result.changes !== 1) throw new Error('BLUEPRINT_CHARACTER_SYNC_READ_BACK_FAILED')
+            const completed = readCharacterSyncOperation(db, operationId)
+            if (!completed || completed.status !== 'completed' || !completed.completionReceipt) {
+                throw new Error('BLUEPRINT_CHARACTER_SYNC_READ_BACK_FAILED')
+            }
+            assertAuthoritativeCharacterSyncCompletion(db, completed)
+            return completed
+        })
+        return tx()
+    }
+
+    /** 删除蓝图 */
+    static delete(chapterNumber: number): void {
+        const db = requireProjectDb()
+
+        db.prepare('DELETE FROM blueprints WHERE chapter_number = ?').run(chapterNumber)
+    }
+
+    /** 删除所有章节蓝图 */
+    static clearAll(): void {
+        const db = requireProjectDb()
+        const tx = db.transaction(() => {
+            clearBlueprintFactsWithinTransaction(db)
+        })
+        tx()
+    }
+
+    /** 仅更新 notes 字段 */
+    static updateNotes(chapterNumber: number, notes: string, db = requireProjectDb()): boolean {
+
+        const result = db.prepare(`
+      UPDATE blueprints
+      SET notes = ?, notes_updated_at = datetime('now'), updated_at = datetime('now')
+      WHERE chapter_number = ?
+    `).run(notes, chapterNumber)
+        return result.changes > 0
+    }
+}
