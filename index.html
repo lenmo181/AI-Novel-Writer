@@ -9,29 +9,52 @@
     <!-- 同步读取主题，避免加载页与主界面背景色闪跳 -->
     <script>
       (function() {
-        var bgMap = { light: '#F7F3E8', galaxy: '#0A1628', paper: '#F7F3E8', dark: '#1E1E1E' };
-        var theme = 'paper';
+        /* 与 paper-ink 令牌同步：浅色 --frame / 深色 --frame，以及两套加载器配色 */
+        var palettes = {
+          light: {
+            bg: '#EAE8E2', accent: '#2C4A8C', neutral: '#666670', ok: '#4E7E6B', warn: '#B5761D',
+            seal: '#B5473B', vermilion: '#B5473B', paper: '#FFFEFB', ink: '#17171A',
+          },
+          dark: {
+            bg: '#0B0D12', accent: '#8B7CFF', neutral: '#737E91', ok: '#7FC0A4', warn: '#E0B15C',
+            seal: '#E08A7A', vermilion: '#E08A7A', paper: '#1A1F2B', ink: '#E8ECF4',
+          },
+        };
+        var theme = 'light';
         try {
-          var raw = localStorage.getItem('ai-novel-writer-theme');
+          /* v3 外观配置是权威来源；旧键只在迁移场景兜底 */
+          var raw = localStorage.getItem('ai-novel-writer-appearance-v3');
           if (raw) {
-            var state = JSON.parse(raw).state || {};
-            var candidate = state.resolvedTheme || state.theme;
-            if (candidate === 'night') candidate = 'dark'; // 兼容旧版
-            if (Object.prototype.hasOwnProperty.call(bgMap, candidate)) {
-              theme = candidate;
+            var profile = JSON.parse(raw) || {};
+            if (profile.colorTheme === 'dark' || profile.colorTheme === 'light') theme = profile.colorTheme;
+          } else {
+            var legacy = localStorage.getItem('ai-novel-writer-theme');
+            if (legacy) {
+              var state = JSON.parse(legacy).state || {};
+              var candidate = state.resolvedTheme || state.theme;
+              if (candidate === 'night') candidate = 'dark';
+              if (candidate === 'galaxy' || candidate === 'dark') theme = 'dark';
             }
           }
         } catch(e) {}
-        
-        var bg = bgMap[theme] || bgMap.galaxy;
-        
+
+        var palette = palettes[theme] || palettes.light;
+
         // 提前给 html 注入主题 class，确保所有全局 CSS 变量立即生效
         document.documentElement.classList.remove('light', 'dark', 'galaxy', 'paper');
         document.documentElement.classList.add(theme);
-        
-        document.body.style.backgroundColor = bg;
-        /* 将背景色注入 CSS 变量供启动加载器引用 */
-        document.documentElement.style.setProperty('--loader-bg', bg);
+
+        document.body.style.backgroundColor = palette.bg;
+        /* 将加载器配色注入 CSS 变量供启动加载器引用 */
+        document.documentElement.style.setProperty('--loader-bg', palette.bg);
+        document.documentElement.style.setProperty('--loader-accent', palette.accent);
+        document.documentElement.style.setProperty('--loader-neutral', palette.neutral);
+        document.documentElement.style.setProperty('--loader-ok', palette.ok);
+        document.documentElement.style.setProperty('--loader-warn', palette.warn);
+        document.documentElement.style.setProperty('--loader-seal', palette.seal);
+        document.documentElement.style.setProperty('--loader-vermilion', palette.vermilion);
+        document.documentElement.style.setProperty('--loader-paper', palette.paper);
+        document.documentElement.style.setProperty('--loader-ink', palette.ink);
       })();
     </script>
     <div id="root">
@@ -43,91 +66,145 @@
           align-items: center;
           height: 100vh;
           width: 100vw;
-          background-color: var(--loader-bg, #0A1628);
-          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+          background:
+            radial-gradient(1100px 720px at 6% -8%, color-mix(in srgb, var(--loader-warn, #B5761D) 10%, transparent), transparent 62%),
+            radial-gradient(920px 640px at 98% 10%, color-mix(in srgb, var(--loader-accent, #2C4A8C) 9%, transparent), transparent 58%),
+            radial-gradient(1200px 760px at 46% 110%, color-mix(in srgb, var(--loader-vermilion, #B5473B) 7%, transparent), transparent 62%),
+            var(--loader-bg, #EAE8E2);
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Serif SC", serif;
           user-select: none;
+          overflow: hidden;
         }
-        
-        .ai-writer-core-container {
+
+        .ai-writer-scene {
           position: relative;
-          width: 80px;
-          height: 80px;
           display: flex;
-          justify-content: center;
+          flex-direction: column;
           align-items: center;
-          margin-bottom: 24px;
+          gap: 14px;
+          animation: ai-writer-rise .9s cubic-bezier(.2, .8, .2, 1) both;
         }
 
-        .ai-writer-ring {
+        /* 画布上两团缓缓漂移的颜料晕 */
+        .ai-writer-wash {
           position: absolute;
-          width: 100%;
-          height: 100%;
           border-radius: 50%;
-          border: 2px solid transparent;
-          border-top-color: rgba(181, 64, 44, 0.82);
-          border-bottom-color: rgba(84, 102, 110, 0.82);
-          animation: ai-writer-spin 2s cubic-bezier(0.68, -0.55, 0.265, 1.55) infinite;
+          filter: blur(2px);
+          opacity: .5;
+          pointer-events: none;
+        }
+        .ai-writer-wash--a {
+          width: 220px; height: 220px; left: -150px; top: -120px;
+          background: radial-gradient(circle, color-mix(in srgb, var(--loader-accent, #2C4A8C) 26%, transparent), transparent 70%);
+          animation: ai-writer-drift 7s ease-in-out infinite alternate;
+        }
+        .ai-writer-wash--b {
+          width: 260px; height: 260px; right: -170px; bottom: -130px;
+          background: radial-gradient(circle, color-mix(in srgb, var(--loader-vermilion, #B5473B) 22%, transparent), transparent 70%);
+          animation: ai-writer-drift 9s ease-in-out infinite alternate-reverse;
         }
 
-        .ai-writer-ring-inner {
-          position: absolute;
-          width: 65%;
-          height: 65%;
-          border-radius: 50%;
-          border: 2px solid transparent;
-          border-left-color: rgba(82, 122, 91, 0.76);
-          border-right-color: rgba(198, 138, 58, 0.78);
-          animation: ai-writer-spin-reverse 2.5s cubic-bezier(0.68, -0.55, 0.265, 1.55) infinite;
+        /* 朱红印章：启的品牌记号 */
+        .ai-writer-seal {
+          display: grid;
+          place-items: center;
+          width: 64px;
+          height: 64px;
+          border-radius: 12px;
+          background: var(--loader-seal, #B5473B);
+          color: var(--loader-paper, #FFFEFB);
+          font-size: 34px;
+          font-weight: 700;
+          box-shadow: 0 10px 30px -12px color-mix(in srgb, var(--loader-seal, #B5473B) 65%, transparent);
+          animation: ai-writer-seal .8s cubic-bezier(.34, 1.56, .64, 1) both .15s;
         }
 
-        .ai-writer-core {
-          width: 14px;
-          height: 14px;
-          background: #B5402C;
-          border-radius: 50%;
-          box-shadow: 0 0 20px rgba(181, 64, 44, 0.45), 0 0 40px rgba(84, 102, 110, 0.32);
-          animation: ai-writer-pulse 2s ease-in-out infinite;
+        .ai-writer-brand {
+          margin: 6px 0 0;
+          font-size: 24px;
+          font-weight: 600;
+          letter-spacing: .12em;
+          color: var(--loader-ink, #17171A);
+          animation: ai-writer-fade .7s ease both .45s;
         }
-
-        .ai-writer-text {
-          font-size: 13px;
-          font-weight: 500;
-          letter-spacing: 4px;
-          text-transform: uppercase;
-          background: linear-gradient(90deg, #B5402C, #54666E, #527A5B, #B5402C);
+        .ai-writer-brand i {
+          font-style: italic;
+          font-family: Georgia, 'Times New Roman', serif;
+          letter-spacing: .02em;
+          background: linear-gradient(90deg, var(--loader-accent, #2C4A8C), var(--loader-vermilion, #B5473B), var(--loader-accent, #2C4A8C));
           background-size: 200% auto;
-          color: transparent;
           -webkit-background-clip: text;
           background-clip: text;
+          color: transparent;
           animation: ai-writer-text-shine 3s linear infinite;
         }
 
-        @keyframes ai-writer-spin {
-          0% { transform: rotate(0deg); }
-          100% { transform: rotate(360deg); }
+        .ai-writer-text {
+          margin: 0;
+          font-size: 13px;
+          letter-spacing: .42em;
+          text-indent: .42em;
+          color: var(--loader-neutral, #666670);
+          animation: ai-writer-fade .7s ease both .6s;
         }
 
-        @keyframes ai-writer-spin-reverse {
-          0% { transform: rotate(360deg); }
-          100% { transform: rotate(0deg); }
+        /* 铺纸 shimmer：一道颜料在细轨上往复 */
+        .ai-writer-grind {
+          position: relative;
+          width: 168px;
+          height: 3px;
+          margin-top: 10px;
+          border-radius: 2px;
+          background: color-mix(in srgb, var(--loader-ink, #17171A) 10%, transparent);
+          overflow: hidden;
+          animation: ai-writer-fade .7s ease both .75s;
+        }
+        .ai-writer-grind i {
+          position: absolute;
+          top: 0; bottom: 0; left: -40%;
+          width: 40%;
+          border-radius: 2px;
+          background: linear-gradient(90deg, transparent, var(--loader-seal, #B5473B), transparent);
+          animation: ai-writer-grind 1.6s ease-in-out infinite;
         }
 
-        @keyframes ai-writer-pulse {
-          0%, 100% { transform: scale(0.8); opacity: 0.8; box-shadow: 0 0 15px rgba(181, 64, 44, 0.38); }
-          50% { transform: scale(1.3); opacity: 1; box-shadow: 0 0 30px rgba(84, 102, 110, 0.58), 0 0 50px rgba(82, 122, 91, 0.34); }
+        @keyframes ai-writer-rise {
+          from { transform: translateY(14px); opacity: 0; }
+          to { transform: translateY(0); opacity: 1; }
         }
-
+        @keyframes ai-writer-seal {
+          from { transform: scale(.55) rotate(-6deg); opacity: 0; }
+          60% { transform: scale(1.08) rotate(1deg); opacity: 1; }
+          to { transform: scale(1) rotate(0deg); opacity: 1; }
+        }
+        @keyframes ai-writer-fade {
+          from { opacity: 0; transform: translateY(6px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes ai-writer-drift {
+          from { transform: translate(0, 0) scale(1); }
+          to { transform: translate(36px, 24px) scale(1.12); }
+        }
+        @keyframes ai-writer-grind {
+          0% { left: -40%; }
+          100% { left: 100%; }
+        }
         @keyframes ai-writer-text-shine {
           to { background-position: 200% center; }
         }
+        @media (prefers-reduced-motion: reduce) {
+          .ai-writer-scene *, .ai-writer-scene { animation-duration: .01s !important; animation-iteration-count: 1 !important; }
+        }
       </style>
       <div class="ai-writer-initial-loader">
-        <div class="ai-writer-core-container">
-          <div class="ai-writer-ring"></div>
-          <div class="ai-writer-ring-inner"></div>
-          <div class="ai-writer-core"></div>
+        <div class="ai-writer-scene">
+          <span class="ai-writer-wash ai-writer-wash--a" aria-hidden="true"></span>
+          <span class="ai-writer-wash ai-writer-wash--b" aria-hidden="true"></span>
+          <span class="ai-writer-seal" aria-hidden="true">书</span>
+          <p class="ai-writer-brand">书童 <i>Pagekin</i></p>
+          <p class="ai-writer-text">正在铺纸研墨</p>
+          <span class="ai-writer-grind" aria-hidden="true"><i></i></span>
         </div>
-        <div class="ai-writer-text">书童 正在铺纸研墨</div>
       </div>
     </div>
     <script type="module" src="/src/main.tsx"></script>

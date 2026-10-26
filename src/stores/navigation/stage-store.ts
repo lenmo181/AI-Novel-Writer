@@ -14,13 +14,15 @@ export type StageSheet = { kind: 'run'; tab: RunSheetTab; runId?: string } | { k
 /** 命令面板：commands 是搜索与跳转（⌘K / Ctrl K），chapters 只查章节（⌘P / Ctrl P）。 */
 export type StagePalette = 'commands' | 'chapters'
 
-/** 流程脊从项目数据派生状态时用到、而 project-store 与 draft-store 里没有的两项。 */
+/** 流程脊从项目数据派生状态时用到、而 project-store 与 draft-store 里没有的项。 */
 export interface StageWork {
   /** 这份数据属于哪次打开；同一路径重新打开是新的会话，旧数据不能当新的用。 */
   session: ProjectSessionContext
   /** 故事前提、角色名单、世界观、情节大纲是否已有内容。 */
   architecture: Readonly<Record<string, boolean>>
   blueprints: readonly { chapterNumber: number; title: string }[]
+  /** 全文审校进度：已审章数 / 规划章数 / 待处理问题数；未读到时审校步显示「未读取」。 */
+  review?: { reviewed: number; total: number; openIssues: number }
 }
 
 interface StageState {

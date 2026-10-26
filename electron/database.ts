@@ -8,7 +8,7 @@ import { createRequire } from 'node:module'
 import fs from 'node:fs'
 import { initializeLegacyBaselineSchema } from './migrations/baseline-schema'
 import { CURRENT_DESKTOP_SCHEMA_VERSION, getDesktopMigrationRegistry } from './migrations/desktop-registry'
-import { migrateSchema, verifySchema } from './migrations/runner'
+import { migrateSchema, verifySchemaShallow } from './migrations/runner'
 import { SqliteSchemaAdapter } from './migrations/sqlite-schema-adapter'
 import { activateCanonicalProjectData, upgradeCanonicalProjectData, deactivateProjectData, getNewProjectDatabasePath, getProjectDatabasePath } from './services/project-data-locator'
 
@@ -40,7 +40,8 @@ export function initProjectDatabase(projectPath: string): void {
     activateCanonicalProjectData(projectPath)
     database = new Database(getProjectDatabasePath(projectPath), { fileMustExist: true })
     const adapter = new SqliteSchemaAdapter(database)
-    verifySchema(adapter, getDesktopMigrationRegistry(), CURRENT_DESKTOP_SCHEMA_VERSION)
+    // 例行打开：浅校验（版本+指纹），不做 O(库文件大小) 的全库完整性扫描。
+    verifySchemaShallow(adapter, getDesktopMigrationRegistry(), CURRENT_DESKTOP_SCHEMA_VERSION)
     database.pragma('journal_mode = WAL')
     database.pragma('foreign_keys = ON')
     fenceProjectSession(database)

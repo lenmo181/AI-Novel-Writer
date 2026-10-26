@@ -4,6 +4,8 @@ import { closeProjectDatabase, getCurrentProjectPath, getProjectDb } from '../da
 import type { MainGenerationRunHandle } from '../../src/services/generation/generation-runtime'
 import { assertGenerationSourcesCurrent, assertGenerationSynopsisCommit, commitGenerationPlotOutlineAuthorEdit, commitGenerationBlueprintAuthorEdit, assertImportGenerationSourcesCurrent, recordGenerationDirectoryCommit, withGenerationAgentChildEffect } from './generation-controller'
 import { projectAccess } from '../services/project-access'
+import { reviewCenterOverview } from '../services/review-overview'
+import { chapterFactsOverview } from '../services/chapter-facts-overview'
 import { getProjectDataRoot } from '../services/project-data-locator'
 import { readPortableCurrentAuthority } from '../services/portable-current-authority'
 import { currentDerivedCharacterFields } from '../services/current-character-projection'
@@ -1168,6 +1170,24 @@ export function registerDatabaseController(options: DatabaseControllerOptions = 
         ...(isSourceDraftChangedError(err) ? { errorCode: SOURCE_DRAFT_CHANGED } : {}),
         error: String(err),
       }
+    }
+  })
+
+  ipcMain.handle('db:chapter-facts-overview', async (_event, draftIds: number[], expectedProjectPath: string) => {
+    assertRequiredExpectedProjectPath(getCurrentProjectPath(), expectedProjectPath)
+    const db = getProjectDb()
+    if (!db) throw new Error('PROJECT_NOT_OPEN')
+    return chapterFactsOverview(db, Array.isArray(draftIds) ? draftIds : [])
+  })
+
+  ipcMain.handle('db:review-overview', async (_event, expectedProjectPath: string) => {
+    assertRequiredExpectedProjectPath(getCurrentProjectPath(), expectedProjectPath)
+    try {
+      const db = getProjectDb()
+      if (!db) throw new Error('PROJECT_NOT_OPEN')
+      return { success: true, chapters: reviewCenterOverview(db) }
+    } catch (err) {
+      return { success: false, error: String(err) }
     }
   })
 

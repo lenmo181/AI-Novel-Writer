@@ -117,6 +117,60 @@
   color: var(--rule-strong);
 }
 
+/* ---------- 油画风流程脊：每一步一个专属色相 ---------- */
+/* 设定=黛蓝 架构=赭石 蓝图=藤黄 写作=朱砂 审校=绛紫 定稿=石绿 */
+.stage-row[data-stage='setup'] { --stage-hue: var(--paint-azure); }
+.stage-row[data-stage='architecture'] { --stage-hue: var(--paint-umber); }
+.stage-row[data-stage='blueprint'] { --stage-hue: var(--paint-ochre); }
+.stage-row[data-stage='manuscript'] { --stage-hue: var(--paint-vermilion); }
+.stage-row[data-stage='review'] { --stage-hue: var(--paint-plum); }
+.stage-row[data-stage='finalize'] { --stage-hue: var(--paint-jade); }
+
+.stage-stages .stage-row {
+  position: relative;
+}
+
+/* 当前行左沿的颜料条：像画框侧面露出的一笔 */
+.stage-stages .stage-row::before {
+  content: '';
+  position: absolute;
+  left: calc(-1 * var(--s-2));
+  top: 22%;
+  bottom: 22%;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--stage-hue, var(--accent));
+  opacity: 0;
+  transform: scaleY(.4);
+  transition: opacity var(--dur) var(--ease), transform var(--dur) var(--ease);
+}
+
+.stage-stages .stage-row[aria-current='page']::before {
+  opacity: .85;
+  transform: scaleY(1);
+}
+
+/* 完成的勾、进行中的环、未开始的虚线圈都用这一步的专属色 */
+.stage-stages .stage-row .stage-mark--done {
+  background: var(--stage-hue, var(--ok));
+}
+
+.stage-stages .stage-row .stage-mark--todo {
+  color: color-mix(in srgb, var(--stage-hue, var(--ink-3)) 62%, transparent);
+}
+
+.stage-stages .stage-row .stage-ring-track {
+  stroke: color-mix(in srgb, var(--stage-hue, var(--accent)) 22%, transparent);
+}
+
+.stage-stages .stage-row .stage-ring-fill {
+  stroke: var(--stage-hue, var(--accent));
+}
+
+.stage-stages .stage-row[aria-current='page'] .stage-row-name {
+  color: color-mix(in srgb, var(--stage-hue, var(--ink)) 72%, var(--ink));
+}
+
 .stage-ring {
   flex: none;
   fill: none;

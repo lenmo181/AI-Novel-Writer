@@ -78,7 +78,8 @@ it('shows only current run reasoning in volatile memory and clears it on project
   const runtime = await createWorkflowMainGenerationRuntime({ context, callbacks,
     selection: { operation: 'review-chapter', chapterNumber: 1, promptKeys: [], skillStages: [], output: 'visible-text' } }, transport)
   emitReasoning({ ...handle, attemptId: 'attempt', text: '临时推理' })
-  expect(useWorkflowReasoningStore.getState().entries.workflow?.text).toBe('临时推理')
+  // 推理分块进缓冲、约 160ms 合并提交：等待这批缓冲落地。
+  await vi.waitFor(() => expect(useWorkflowReasoningStore.getState().entries.workflow?.text).toBe('临时推理'))
   const diagnostics = { startedAt: 0, elapsedMs: 10000, firstResponseMs: 1000, lastResponseMs: 10000,
     lastOutputMs: 9000, phase: 'stream' as const, visibleEvents: 0, reasoningEvents: 5 }
   const snapshot: MainGenerationSnapshot = { ...handle, artifactId: 'artifact', attemptId: 'attempt',

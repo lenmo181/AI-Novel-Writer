@@ -38,7 +38,7 @@ function Spine() {
   const view = useStageView()
   useLandingPage(view)
   const ignore = () => undefined
-  return <StageSpine stages={view.stages} chapters={view.chapters} location={view.location} onStage={ignore} onChapter={ignore} onResource={ignore} onSettings={ignore} />
+  return <StageSpine stages={view.stages} chapters={view.chapters} location={view.location} onStage={ignore} onChapter={ignore} onResource={ignore} onExport={ignore} onSettings={ignore} />
 }
 
 function session(leaseId: string): ProjectSessionContext {
@@ -202,14 +202,27 @@ describe('打开作品时流程脊等各稿的审稿与修稿记录', () => {
         case 'db:character-roster-read': return { status: 'ready' }
         case 'db:blueprint-get-all': return [1, 2, 3, 4].map(chapterNumber => ({ chapterNumber, title: `第${chapterNumber}章` }))
         case 'db:draft-list-all': return drafts
-        case 'db:revision-list': return []
-        case 'db:review-list':
-          if (id !== 31) return []
-          await holds[reads++]
-          return [{ id: 5, reviewIndex: 1, createdAt: '2026-10-13 20:00:01' }]
-        case 'db:review-get-full': return { id, content: '' }
-        case 'db:review-cycle-get': return null
-        case 'db:draft-get-full': return { ...drafts.find(draft => draft.id === id), content: '雾是从海面上爬上来的。' }
+        case 'db:chapter-facts-overview': {
+          // chapter-facts 聚合成一次调用：夹具按原逐稿语义现算，稿 31 的审稿读取用 holds 控制先后。
+          const ids = Array.isArray(id) ? id : [id]
+          const factsFor = (draftId: number) => {
+            const reviews = [] as Array<{ id: number; reviewIndex: number; createdAt: string; cycle: string | null }>
+            return {
+              draftId,
+              facts: {
+                mergeable: [],
+                stale: [],
+                latestReview: reviews.length ? { createdAt: reviews[0]!.createdAt, cycleStatus: null } : null,
+                lastMergedAt: null,
+              },
+            }
+          }
+          const first = factsFor(ids[0] as number)
+          if (ids.includes(31)) await holds[reads++]
+          return ids.map((draftId) => draftId === 31
+            ? { draftId, facts: { ...first.facts, latestReview: { createdAt: '2026-10-13 20:00:01', cycleStatus: null } } }
+            : first)
+        }
         default: throw new Error(`unexpected IPC ${channel}`)
       }
     })

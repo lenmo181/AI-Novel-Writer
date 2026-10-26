@@ -216,6 +216,40 @@
   transform: translateY(-3px);
 }
 
+/* 有 AI 封面的书：图片铺满封面，文字浮在下深上浅的渐变上，白字加轻影保证可读。 */
+.stage-book-cover-art {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: inherit;
+}
+
+.stage-book[data-cover] .stage-book-cover {
+  /* 图面封面的文字永远是白字：封面图自带任意底色，主题墨阶不适用 */
+  --cover-ink: var(--cover-text-on-art);
+}
+
+.stage-book[data-cover] .stage-book-cover::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  border-radius: inherit;
+  background: linear-gradient(to top, var(--cover-scrim-strong), var(--cover-scrim-mid) 42%, var(--cover-scrim-fade) 60%);
+  pointer-events: none;
+}
+
+.stage-book[data-cover] .stage-book-kicker,
+.stage-book[data-cover] .stage-book-title,
+.stage-book[data-cover] .stage-book-figure {
+  position: relative;
+  z-index: 2;
+  text-shadow: var(--cover-text-shadow);
+}
+
 /* 按下：从悬停的抬起落回大半，像把书按回书架 */
 .stage-book-cover:active {
   transform: translateY(-1px);
@@ -322,12 +356,32 @@
 
 /* ---------- 概览 ---------- */
 .stage-ov {
+  position: relative;
   display: flex;
   flex-direction: column;
   padding: var(--s-6);
   border-radius: var(--radius-panel);
   background: var(--paper);
   box-shadow: var(--stage-card-drop);
+  overflow: hidden;
+}
+
+/* 卡片顶沿的油画笔触：一道四色高光，像画框上沿的颜料反光 */
+.stage-ov::before,
+.stage-work-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: var(--brush-stroke);
+  opacity: .8;
+}
+
+.stage-work-card {
+  position: relative;
+  overflow: hidden;
 }
 
 .stage-ov .stage-eyebrow {
@@ -651,4 +705,137 @@
       0 0 0 6px var(--surface),
       0 0 0 8px var(--accent);
   }
+}
+
+
+/* ===== 封面工作台 ===== */
+.cover-studio {
+  display: flex;
+  gap: var(--s-5);
+  align-items: stretch;
+}
+
+.cover-studio-preview {
+  position: relative;
+  flex: none;
+  width: 168px;
+  aspect-ratio: 2 / 3;
+  border-radius: var(--radius);
+  border: 1px solid var(--rule-strong);
+  background:
+    linear-gradient(to bottom, color-mix(in srgb, var(--ink) 4%, transparent), transparent),
+    var(--surface-2);
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+}
+
+.cover-studio-preview img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.cover-studio-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--s-2);
+  color: var(--ink-3);
+  font-size: var(--fs-12);
+}
+
+.cover-studio-veil {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  background: color-mix(in srgb, var(--paper) 55%, transparent);
+  color: var(--accent);
+}
+
+.cover-studio-form {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+}
+
+.cover-studio-error {
+  margin: 0;
+  padding: 6px 10px;
+  border-radius: var(--radius);
+  background: var(--danger-soft);
+  border: 1px solid var(--danger-line);
+  color: var(--danger);
+  font-size: var(--fs-12);
+}
+
+@media (max-width: 560px) {
+  .cover-studio {
+    flex-direction: column;
+  }
+
+  .cover-studio-preview {
+    width: 128px;
+  }
+}
+
+
+/* ===== 更新弹窗 ===== */
+.update-popup-notes {
+  margin-top: var(--s-2);
+  max-height: 260px;
+  overflow-y: auto;
+  padding: var(--s-3) var(--s-4);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  background: var(--surface);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: var(--fs-13);
+  line-height: 1.7;
+  color: var(--ink-2);
+}
+
+
+/* ===== 书房工作状态卡 ===== */
+/* 只有存在真实待办（审稿问题、进行中任务）时才渲染，不堆空卡片。 */
+.stage-work-status {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+}
+
+.stage-work-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: var(--s-4);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-lg);
+  background: var(--paper);
+  box-shadow: var(--stage-card-drop);
+}
+
+.stage-work-card-title {
+  margin: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-12);
+  font-weight: 600;
+  letter-spacing: .08em;
+  color: var(--accent);
+}
+
+.stage-work-card-text {
+  margin: 0 0 2px;
+  font-size: var(--fs-13);
+  line-height: 1.6;
+  color: var(--ink-2);
 }

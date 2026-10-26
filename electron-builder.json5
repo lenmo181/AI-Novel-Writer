@@ -33,6 +33,10 @@
       {
         "from": "electron/security/darwin-safe-file-system",
         "to": "security/darwin-safe-file-system"
+      },
+      {
+        "from": "CHANGELOG.md",
+        "to": "CHANGELOG.md"
       }
     ]
   },
@@ -62,6 +66,10 @@
       {
         "from": "build/cm-cloud-manage",
         "to": "cm-cloud-manage"
+      },
+      {
+        "from": "CHANGELOG.md",
+        "to": "CHANGELOG.md"
       }
     ]
   },

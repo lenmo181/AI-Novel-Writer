@@ -511,7 +511,7 @@ describe('单章视图的主按钮随五种状态变化', () => {
 async function mountWithSpine() {
   const SpineBeside = () => {
     const view = useStageView()
-    return <StageSpine stages={view.stages} chapters={view.chapters} location={view.location} onStage={() => {}} onChapter={() => {}} onResource={() => {}} onSettings={() => {}} />
+    return <StageSpine stages={view.stages} chapters={view.chapters} location={view.location} onStage={() => {}} onChapter={() => {}} onResource={() => {}} onExport={() => {}} onSettings={() => {}} />
   }
   host = document.createElement('div')
   host.className = 'paper-ink stage-shell'

@@ -16,7 +16,9 @@ import { LibraryUpdateCard } from '../StageUpdate'
 import { useModelMissing } from '../use-model-missing'
 import { useStageView } from '../use-stage-work'
 import BookOverview from './BookOverview'
+import CoverDialog, { type CoverDialogTarget } from './CoverDialog'
 import ShelfBook from './ShelfBook'
+import { WorkStatusCards } from './WorkStatusCards'
 import { shelfTime } from './shelf-format'
 import { barsFromOverview, barsFromStages, nextStep } from './shelf-progress'
 import { useShelfOverview, type ShelfBook as Book } from './use-shelf-overview'
@@ -107,6 +109,7 @@ export default function StageLibrary() {
   const now = useMemo(() => new Date(), [])
   const [removing, setRemoving] = useState<Book | null>(null)
   const [deleting, setDeleting] = useState<{ name: string; path: string } | null>(null)
+  const [coverTarget, setCoverTarget] = useState<CoverDialogTarget | null>(null)
 
   // 最近项目读到之前不下「书架是空的」的结论，老用户启动时不会先闪一下空书房。
   const listed = useProjectStore(s => s.recentProjectsLoaded)
@@ -127,6 +130,11 @@ export default function StageLibrary() {
       book.current
         ? { id: 'continue', label: text('回到作品', 'Back to the book'), onSelect: () => navigate({ kind: 'stage' }) }
         : { id: 'open', label: text('打开作品', 'Open book'), onSelect: book.onOpen },
+      { id: 'cover', label: text('AI 生成封面…', 'AI cover…'), onSelect: () => {
+        if (book.projectId) {
+          setCoverTarget({ projectId: book.projectId, name: book.name, genre: book.current ? config?.genre || undefined : undefined })
+        }
+      }, disabled: !book.projectId },
       { id: 'remove', label: text('从最近项目移除…', 'Remove from recent…'), onSelect: () => setRemoving(book) },
     ] },
     { id: 'danger', tone: 'danger', items: [book.current && currentProject
@@ -220,11 +228,13 @@ export default function StageLibrary() {
       {!waiting && (
         <aside className="stage-lib-aside" aria-label={text('作品概览', 'Book overview')}>
           {overviewCard}
+          <WorkStatusCards />
           {modelMissing && <ModelMissingNotice />}
           <LibraryUpdateCard />
         </aside>
       )}
 
+      <CoverDialog key={coverTarget?.projectId ?? 'closed'} target={coverTarget} onClose={() => setCoverTarget(null)} />
       <InkDialog
         open={removing !== null}
         onOpenChange={open => { if (!open) setRemoving(null) }}

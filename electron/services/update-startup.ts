@@ -4,9 +4,12 @@ import {
   type UpdatePreferencesStore,
   type UpdateServiceOptions,
 } from './update-service'
+import { AUTOMATIC_CHECK_INTERVAL_MS } from './update-service'
 
 export interface UpdateStartupDependencies {
   updateRuntimeEnabled: boolean
+  /** 定时自动检查的周期；默认每小时，测试可以缩短。 */
+  automaticCheckIntervalMs?: number
   updateConfiguration?: UpdateServiceOptions['updateConfiguration']
   updateAction?: UpdateServiceOptions['updateAction']
   openRelease?: UpdateServiceOptions['openRelease']
@@ -73,4 +76,13 @@ export function startUpdateRuntime(dependencies: UpdateStartupDependencies): voi
   void service.checkAutomatically().catch((error: unknown) => {
     dependencies.reportFailure('自动检查更新', error)
   })
+
+  // 之后每小时再探一次：服务内部仍有“每小时一次”的节流，双保险不会重复联网。
+  const intervalMs = dependencies.automaticCheckIntervalMs ?? AUTOMATIC_CHECK_INTERVAL_MS
+  const timer = setInterval(() => {
+    void service.checkAutomatically().catch((error: unknown) => {
+      dependencies.reportFailure('定时自动检查更新', error)
+    })
+  }, intervalMs)
+  timer.unref?.()
 }

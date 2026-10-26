@@ -38,6 +38,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function validProjectId(value: string): boolean {
+  // 正则就是要在字符串里找出控制字符，这是唯一按码位表达的方式。
+  // eslint-disable-next-line no-control-regex
   return value.length > 0 && value.length <= 256 && !/[\u0000-\u001f\u007f-\u009f]/u.test(value)
 }
 

@@ -549,7 +549,7 @@ export function ModelForm({
         <Button variant="ghost" onClick={onCancel}>{text('取消', 'Cancel')}</Button>
       </div>
       {testResult && (
-        <div className={`text-xs p-2 rounded ${testResult.success ? 'bg-green-500/10 text-[var(--color-success-text)] border border-green-500/20' : 'bg-red-500/10 text-[var(--color-error-text)] border border-red-500/20'} break-all`}>
+        <div className={`text-xs p-2 rounded ${testResult.success ? 'bg-[var(--color-success-soft)] text-[var(--color-success-text)] border border-[var(--color-success-line)]' : 'bg-[var(--color-error-soft)] text-[var(--color-error-text)] border border-[var(--color-error-line)]'} break-all`}>
           {testResult.success
             ? text('连接成功', 'Connection succeeded')
             : text(`连接失败：${testFailure}`, englishWithReason('Connection failed', testFailure, ': '))}

@@ -1,0 +1,338 @@
+/* ================= 全文审稿中心 ================= */
+/* 全书视角的问题看板：汇总统计、筛选、按章分组的问题列表。只引用纸墨令牌。 */
+.stage-review-center {
+  height: 100%;
+  overflow-y: auto;
+  padding: var(--s-8) var(--s-10) var(--s-12);
+  box-sizing: border-box;
+}
+
+.stage-review-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--s-4);
+  max-width: 880px;
+  margin: 0 auto var(--s-6);
+}
+
+.stage-review-title {
+  margin: 0;
+  font: 600 var(--fs-30)/1.2 var(--font-display);
+  letter-spacing: .02em;
+  color: var(--ink);
+}
+
+.stage-review-lede {
+  margin: 8px 0 0;
+  max-width: 560px;
+  font-size: var(--fs-13);
+  color: var(--ink-2);
+}
+
+.stage-review-head-actions {
+  display: flex;
+  gap: var(--s-2);
+  flex: none;
+}
+
+.stage-review-error {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  max-width: 880px;
+  margin: 0 auto var(--s-4);
+  padding: 8px 12px;
+  border: 1px solid var(--danger-line);
+  border-radius: var(--radius);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: var(--fs-12);
+}
+
+.stage-review-empty {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: var(--s-12) 0;
+  text-align: center;
+  color: var(--ink-3);
+}
+
+.stage-review-empty-actions {
+  display: flex;
+  justify-content: center;
+  gap: var(--s-2);
+  margin-top: var(--s-3);
+}
+
+/* 汇总统计 */
+.stage-review-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: var(--s-3);
+  max-width: 880px;
+  margin: 0 auto var(--s-5);
+}
+
+.stage-review-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--s-3) var(--s-4);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+
+.stage-review-stat b {
+  font: 500 var(--fs-24)/1.2 var(--font-num);
+  color: var(--ink);
+}
+
+.stage-review-stat[data-kind='error'] b { color: var(--danger); }
+.stage-review-stat[data-kind='warning'] b { color: var(--warn); }
+.stage-review-stat[data-kind='unknown'] b { color: var(--ink-2); }
+
+.stage-review-stat span {
+  font-size: var(--fs-11);
+  letter-spacing: .08em;
+  color: var(--ink-3);
+}
+
+/* 筛选行 */
+.stage-review-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+  max-width: 880px;
+  margin: 0 auto var(--s-5);
+}
+
+/* 按章分组 */
+.stage-review-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-4);
+  max-width: 880px;
+  margin: 0 auto;
+}
+
+.stage-review-chapter {
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-panel);
+  background: var(--paper);
+  overflow: hidden;
+}
+
+.stage-review-chapter-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  padding: var(--s-3) var(--s-4);
+  border-bottom: 1px solid var(--rule);
+  background: var(--surface);
+}
+
+.stage-review-chapter-toggle {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-3);
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  color: inherit;
+}
+
+.stage-review-chapter-title {
+  margin: 0;
+  font: 600 var(--fs-16)/1.3 var(--font-display);
+  letter-spacing: .04em;
+  color: var(--ink);
+}
+
+.stage-review-chapter-meta {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-12);
+  color: var(--ink-3);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.stage-review-chapter-counts {
+  flex: none;
+  font-size: var(--fs-12);
+  color: var(--ink-2);
+}
+
+.stage-review-chapter-actions {
+  flex: none;
+}
+
+.stage-review-chapter-body {
+  padding: var(--s-3) var(--s-4) var(--s-4);
+}
+
+.stage-review-none,
+.stage-review-parse-error {
+  margin: 0;
+  font-size: var(--fs-12);
+  color: var(--ink-3);
+}
+
+.stage-review-parse-error {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  color: var(--warn);
+}
+
+/* 问题条目 */
+.stage-review-issues {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+}
+
+.stage-review-issue {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: var(--s-3) 0;
+  border-bottom: 1px solid var(--rule);
+}
+
+.stage-review-issue:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.stage-review-issue-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  flex-wrap: wrap;
+}
+
+.stage-review-severity {
+  flex: none;
+  padding: 1px 8px;
+  border-radius: var(--radius-pill);
+  font-size: var(--fs-11);
+  letter-spacing: .06em;
+}
+
+.stage-review-issue[data-severity='error'] .stage-review-severity {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.stage-review-issue[data-severity='warning'] .stage-review-severity {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.stage-review-issue[data-severity='unknown'] .stage-review-severity {
+  background: var(--wash);
+  color: var(--ink-2);
+}
+
+.stage-review-issue[data-severity='pass'] .stage-review-severity {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.stage-review-category {
+  font-size: var(--fs-12);
+  font-weight: 600;
+  color: var(--ink-2);
+}
+
+.stage-review-status {
+  padding: 1px 8px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--rule-strong);
+  font-size: var(--fs-11);
+  color: var(--ink-2);
+}
+
+.stage-review-status[data-status='resolved'] {
+  border-color: transparent;
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.stage-review-status[data-status='author-waived'] {
+  border-color: transparent;
+  background: var(--wash);
+  color: var(--ink-3);
+}
+
+.stage-review-locate {
+  margin-left: auto;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: var(--radius);
+  background: none;
+  font: inherit;
+  font-size: var(--fs-12);
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.stage-review-locate:hover {
+  background: var(--accent-soft);
+}
+
+.stage-review-description {
+  margin: 0;
+  font-size: var(--fs-13);
+  line-height: 1.7;
+  color: var(--ink);
+}
+
+.stage-review-quote {
+  margin: 0;
+  padding: 6px 10px;
+  border-left: 2px solid var(--accent-line);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  background: var(--surface);
+  font: 400 var(--fs-12)/1.7 var(--font-prose);
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+}
+
+.stage-review-source {
+  margin: 0;
+  font-size: var(--fs-11);
+  color: var(--ink-3);
+}
+
+/* 窄窗：统计卡两列、头部纵排 */
+@media (max-width: 720px) {
+  .stage-review-center {
+    padding: var(--s-5) var(--s-4) var(--s-8);
+  }
+
+  .stage-review-head {
+    flex-direction: column;
+  }
+
+  .stage-review-chapter-head {
+    flex-wrap: wrap;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stage-review-center * {
+    transition: none !important;
+  }
+}

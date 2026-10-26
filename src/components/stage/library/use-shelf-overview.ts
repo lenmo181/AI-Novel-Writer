@@ -13,6 +13,8 @@ export interface ShelfBook {
   id: string
   name: string
   path: string
+  /** 项目清单里的稳定 id：封面按它存取；能力签发失败时缺省。 */
+  projectId?: string
   updatedAt: string
   current: boolean
   onPreview: () => void
@@ -116,6 +118,7 @@ export function useShelfOverview() {
       id: project.previewCapabilityId ?? project.path,
       name: project.name,
       path: project.path,
+      projectId: project.projectId ?? (currentProject && sameProjectPathKey(currentProject.path, project.path) ? currentProject.id : undefined),
       updatedAt: project.updatedAt,
       current: Boolean(currentProject && sameProjectPathKey(currentProject.path, project.path)),
       onPreview: () => preview(project),

@@ -20,6 +20,8 @@
 
 /* ================= 卡片 ================= */
 .run-card {
+  position: relative;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -542,5 +544,137 @@ button.run-step-row:hover {
   height: 1px;
   overflow: hidden;
   clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+
+/* ================= 运行动态 ================= */
+/* 卡顶的进度颜料条：随步骤完成往前推，运行中带一道流动高光 */
+.run-progress {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  border-radius: 3px 3px 0 0;
+  background: color-mix(in srgb, var(--ink) 8%, transparent);
+  overflow: hidden;
+}
+
+.run-progress::before {
+  content: '';
+  position: absolute;
+  top: 0; bottom: 0; left: 0;
+  width: var(--run-progress, 0%);
+  border-radius: 3px;
+  background: linear-gradient(90deg, var(--paint-azure), var(--paint-plum) 55%, var(--paint-vermilion));
+  transition: width var(--dur) var(--ease);
+}
+
+.run-progress[data-live]::after {
+  content: '';
+  position: absolute;
+  top: 0; bottom: 0; left: -30%;
+  width: 30%;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--paper) 55%, transparent), transparent);
+  animation: run-progress-sheen 1.6s ease-in-out infinite;
+}
+
+@keyframes run-progress-sheen {
+  to { left: 110%; }
+}
+
+/* 运行中的卡：左沿一道呼吸的颜料边 */
+.run-card[data-state='running'],
+.run-card[data-state='waiting'] {
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--paint-vermilion) 55%, transparent), var(--shadow-pop);
+}
+
+.run-card[data-state='running'] .run-card-title {
+  animation: run-title-breathe 2.8s ease-in-out infinite;
+}
+
+@keyframes run-title-breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .72; }
+}
+
+/* 正在跑的步骤：名字上的一道光扫过，图标圆环呼吸 */
+.run-step[data-status='running'] .run-step-name {
+  animation: run-step-breathe 1.8s ease-in-out infinite;
+}
+
+@keyframes run-step-breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .62; }
+}
+
+.run-step[data-status='running'] .run-step-icon {
+  color: var(--paint-vermilion);
+  animation: run-step-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes run-step-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .6; transform: scale(.9); }
+}
+
+/* 推理中的呼吸点：实时输出追加时给出“正在写”的动感 */
+.run-step[data-status='running'] .run-step-meta {
+  color: color-mix(in srgb, var(--paint-vermilion) 62%, var(--ink-3));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .run-progress[data-live]::after,
+  .run-card[data-state='running'] .run-card-title,
+  .run-step[data-status='running'] .run-step-name,
+  .run-step[data-status='running'] .run-step-icon {
+    animation: none;
+  }
+}
+
+
+
+/* ================= 可恢复区折叠 ================= */
+.run-recovery-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease);
+}
+
+.run-recovery-toggle:hover {
+  background: var(--wash);
+  color: var(--ink);
+}
+
+.run-recovery-chevron {
+  flex: none;
+  color: var(--ink-3);
+  transition: transform var(--dur-fast) var(--ease);
+}
+
+.run-recovery-toggle[aria-expanded='true'] .run-recovery-chevron {
+  transform: rotate(90deg);
+}
+
+.run-recovery-hint {
+  margin-left: auto;
+  overflow: hidden;
+  font-size: 11.5px;
+  font-weight: 400;
+  color: var(--ink-3);
+  text-overflow: ellipsis;
   white-space: nowrap;
 }

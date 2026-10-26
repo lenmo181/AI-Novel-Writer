@@ -1,16 +1,17 @@
 import { useEffect, useRef, type ReactNode } from 'react'
-import { Check, CircleDashed, GitBranch, History, Library, Settings, type LucideIcon } from 'lucide-react'
+import { BookOpenCheck, Check, CircleDashed, GitBranch, History, Library, Settings, type LucideIcon } from 'lucide-react'
 import { useLocaleStore } from '../../stores/locale-store'
 import type { ResourcePage, WorkStage } from '../../stores/navigation/navigation-intents'
 import { chapterLabel } from '../../shared/chapter-label'
 import type { ChapterRow, StageLocation, StageProgress, StageStatus } from '../../stores/navigation/stage-progress'
 import { ProgressRing } from './ProgressRing'
-import { CHAPTER_PHASE_TEXT, CHAPTER_RUNNING_TEXT, RESOURCE_NAMES, STAGE_NAMES } from './stage-text'
+import type { StageWork } from '../../stores/navigation/stage-store'
+import { CHAPTER_PHASE_TEXT, CHAPTER_RUNNING_TEXT, FLOW_EXTENSION_NAMES, RESOURCE_NAMES, STAGE_NAMES } from './stage-text'
 import { pluralEn } from '../../shared/plural-en'
 
 type Text = (zh: string, en: string) => string
 
-const RESOURCE_ICONS: Record<ResourcePage, LucideIcon> = { plot: GitBranch, knowledge: Library, history: History }
+const RESOURCE_ICONS: Record<ResourcePage, LucideIcon> = { plot: GitBranch, knowledge: Library, history: History, 'review-center': BookOpenCheck }
 
 /** 未开始时说明这一步做什么，开始后给出进度。 */
 function stageMeta(status: StageStatus, text: Text): string {
@@ -53,12 +54,15 @@ interface StageSpineProps {
   onStage: (stage: WorkStage) => void
   onChapter: (chapterNumber: number) => void
   onResource: (page: ResourcePage) => void
+  onExport: () => void
+  /** 全文审校进度；数据没读到时审校步显示「未读取」。 */
+  review?: StageWork['review']
   /** 设置页开着时只有「设置」是当前位置。 */
   settingsOpen?: boolean
   onSettings: () => void
 }
 
-export default function StageSpine({ stages, chapters, location: activeLocation, settingsOpen, onStage, onChapter, onResource, onSettings }: StageSpineProps) {
+export default function StageSpine({ stages, chapters, location: activeLocation, settingsOpen, onStage, onChapter, onResource, onExport, review, onSettings }: StageSpineProps) {
   const location = settingsOpen ? null : activeLocation
   const text = useLocaleStore(s => s.text)
   const currentStage = location?.kind === 'stage' ? location.stage : null
@@ -79,6 +83,22 @@ export default function StageSpine({ stages, chapters, location: activeLocation,
     </li>
   )
 
+  // 流程脊第五步：审校（全书问题看板）。进度来自打开作品时聚合好的审校概览。
+  const manuscript = stages.find(status => status.stage === 'manuscript')
+  const finalizeTotal = manuscript?.stage === 'manuscript' ? manuscript.total : 0
+  const finalizeDone = manuscript?.stage === 'manuscript' ? manuscript.finalized : 0
+  const reviewState: StageProgress = !review || review.total === 0
+    ? { state: 'todo' }
+    : review.reviewed >= review.total && review.openIssues === 0
+      ? { state: 'done' }
+      : review.reviewed > 0 ? { state: 'active', ratio: Math.min(1, review.reviewed / Math.max(1, review.total)) } : { state: 'todo' }
+  const finalizeState: StageProgress = finalizeTotal > 0 && finalizeDone >= finalizeTotal
+    ? { state: 'done' }
+    : finalizeDone > 0 ? { state: 'active', ratio: Math.min(1, finalizeDone / finalizeTotal) } : { state: 'todo' }
+  const activeExtension = location?.kind === 'resource' && location.page === 'review-center'
+    ? 'review'
+    : null
+
   return (
     <nav className="stage-spine" aria-label={text('创作流程', 'Writing flow')}>
       <div className="stage-spine-label" aria-hidden="true">{text('创作流程', 'Writing flow')}</div>
@@ -88,6 +108,26 @@ export default function StageSpine({ stages, chapters, location: activeLocation,
           <span className="stage-row-name">{text(...STAGE_NAMES[status.stage])}</span>
           <span className="stage-row-meta">{stageMeta(status, text)}</span>
         </>, { 'data-state': status.progress.state, 'data-stage': status.stage }))}
+        {row('review', activeExtension === 'review', () => onResource('review-center'), <>
+          <StageMark progress={reviewState} />
+          <span className="stage-row-name">{text(...FLOW_EXTENSION_NAMES.review)}</span>
+          <span className="stage-row-meta">
+            {!review || review.total === 0
+              ? text('全书问题看板', 'Book-wide issue board')
+              : review.openIssues > 0
+                ? text(`已审 ${review.reviewed}/${review.total} 章 · ${review.openIssues} 待处理`, `Reviewed ${review.reviewed}/${review.total} · ${review.openIssues} open`)
+                : text(`已审 ${review.reviewed}/${review.total} 章`, `Reviewed ${review.reviewed}/${review.total}`)}
+          </span>
+        </>, { 'data-state': reviewState.state, 'data-stage': 'review' })}
+        {row('finalize', false, onExport, <>
+          <StageMark progress={finalizeState} />
+          <span className="stage-row-name">{text(...FLOW_EXTENSION_NAMES.finalize)}</span>
+          <span className="stage-row-meta">
+            {finalizeTotal > 0
+              ? text(`${finalizeDone} / ${finalizeTotal} 定稿`, `${finalizeDone} / ${finalizeTotal} final`)
+              : text('导出成书', 'Export the book')}
+          </span>
+        </>, { 'data-state': finalizeState.state, 'data-stage': 'finalize' })}
       </ol>
 
       {chapterListShown && (

@@ -3,6 +3,7 @@ import { assertGlobalDataReady } from './services/app-data-locator'
 import { getCurrentProjectPath, getProjectDb } from './database'
 
 import { registerConfigController } from './controllers/config-controller'
+import { registerCoverController } from './controllers/cover-controller'
 import { registerProjectController } from './controllers/project-controller'
 import { registerProjectArchiveController } from './controllers/project-archive-controller'
 import { registerCloudBackupController } from './controllers/cloud-backup-controller'
@@ -39,6 +40,7 @@ export function registerIPCHandlers() {
   registerOfficialHomepageController()
   registerModelProviderResourceController()
   registerConfigController()
+  registerCoverController()
   registerAppDataController()
   const cloudProjectBindings = new CloudProjectBindingStore()
   const cmCloudBackup = new CmCloudBackupService()

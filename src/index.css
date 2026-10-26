@@ -178,21 +178,22 @@
     background: transparent;
   }
 
+  /* 跟随主题的滚动条：纸墨作用域里 --color-text-muted 换成纸墨墨阶，旧作用域里用 :root/.dark 的值 */
   ::-webkit-scrollbar-thumb {
-    background: rgba(128, 128, 128, 0.25);
+    background: color-mix(in srgb, var(--color-text-muted, #696972) 30%, transparent);
     border-radius: 3px;
   }
 
   ::-webkit-scrollbar-thumb:hover {
-    background: rgba(128, 128, 128, 0.45);
+    background: color-mix(in srgb, var(--color-text-muted, #696972) 48%, transparent);
   }
 
   .dark ::-webkit-scrollbar-thumb {
-    background: rgba(128, 128, 128, 0.20);
+    background: color-mix(in srgb, var(--color-text-muted, #737E91) 26%, transparent);
   }
 
   .dark ::-webkit-scrollbar-thumb:hover {
-    background: rgba(128, 128, 128, 0.40);
+    background: color-mix(in srgb, var(--color-text-muted, #737E91) 42%, transparent);
   }
 }
 

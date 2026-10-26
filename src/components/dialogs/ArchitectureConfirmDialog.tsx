@@ -128,9 +128,9 @@ export default function ArchitectureConfirmDialog(props: ArchitectureConfirmForm
                     data-mark={mark}
                     className={`text-[0.7rem] px-1.5 py-0.5 rounded flex-shrink-0 ${
                       mark === 'overwrite' || mark === 'invalid'
-                        ? 'bg-yellow-500/15 text-[var(--color-warning-text)]'
+                        ? 'bg-[var(--color-warning-soft)] text-[var(--color-warning-text)]'
                         : mark === 'keep'
-                          ? 'bg-green-500/10 text-[var(--color-success-text)]'
+                          ? 'bg-[var(--color-success-soft)] text-[var(--color-success-text)]'
                           : 'bg-[color-mix(in_srgb,var(--color-accent)_10%,transparent)] text-[var(--color-accent)]'
                     }`}
                   >
@@ -247,14 +247,14 @@ export default function ArchitectureConfirmDialog(props: ArchitectureConfirmForm
           )}
 
           {noneSelected && (
-            <p className="text-xs px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20 text-[var(--color-error-text)]">
+            <p className="text-xs px-3 py-2 rounded-lg bg-[var(--color-error-soft)] border border-[var(--color-error-line)] text-[var(--color-error-text)]">
               <AlertTriangle size={13} className="inline mr-1" />
               {text('请至少勾选一个步骤', 'Select at least one section.')}
             </p>
           )}
           {/* 前置校验失败提示 */}
           {guardError && (
-            <div className="flex items-start gap-2 px-3 py-2.5 rounded-lg text-xs bg-yellow-500/10 border border-yellow-500/30 text-[var(--color-warning-text)]">
+            <div className="flex items-start gap-2 px-3 py-2.5 rounded-lg text-xs bg-[var(--color-warning-soft)] border border-[var(--color-warning-line)] text-[var(--color-warning-text)]">
               <AlertCircle size={13} className="flex-shrink-0 mt-0.5 text-[var(--color-warning)]" />
               <span className="whitespace-pre-line">{guardError}</span>
             </div>

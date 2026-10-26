@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { ChevronRight, CircleCheck, CircleDashed, CircleX, Pause, Play } from 'lucide-react'
 import { pluralEn } from '../../../shared/plural-en'
 import { useLLMStore } from '../../../stores/llm-store'
@@ -53,6 +53,9 @@ export function RunCard({ run, caption, focused, primary = false }: { run: Workf
   const confirmation = useWorkflowConfirmation(run)
   const batch = run.type === 'batch_generate'
   const model = useLLMStore(s => s.models.find(candidate => candidate.id === run.generationModelId)?.name)
+  // 运行进度：完成的步骤占比；生成中也能看见卡在往前进。
+  const doneSteps = run.steps.filter(step => step.status === 'completed' || step.status === 'skipped').length
+  const runProgress = run.steps.length > 0 ? Math.round((doneSteps / run.steps.length) * 100) : 0
 
   useEffect(() => {
     if (focused) ref.current?.scrollIntoView({ block: 'nearest' })
@@ -61,6 +64,16 @@ export function RunCard({ run, caption, focused, primary = false }: { run: Workf
   const store = useWorkflowStore.getState
   return (
     <article ref={ref} className="run-card" data-state={run.status} aria-labelledby={titleId}>
+      <span
+        className="run-progress"
+        data-live={live || undefined}
+        role="progressbar"
+        aria-label={text('运行进度', 'Run progress')}
+        aria-valuenow={runProgress}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        style={{ '--run-progress': `${runProgress}%` } as CSSProperties}
+      />
       <header className="run-card-head">
         <div className="run-card-heading">
           {caption && <p className="run-card-kicker">{caption}</p>}

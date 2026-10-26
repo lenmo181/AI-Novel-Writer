@@ -17,8 +17,10 @@ export interface UpdateCheckResult {
 export interface UpdatePreferences {
   /** 最近一次检查的时间，供界面显示。 */
   lastCheckedAt?: string
-  /** 最近一次成功自动检查对应的本地日历日，成功检查每天最多一次。 */
+  /** 最近一次成功自动检查对应的本地日历日；保留给旧版本降级读取。 */
   lastAutomaticCheckDate?: string
+  /** 最近一次成功自动检查的时间：自动检查每小时最多一次按它判断。 */
+  lastAutomaticCheckAt?: string
   /** 已确认高于当前版本的正式更新；重启后只恢复“可继续准备”，不伪造已下载状态。 */
   availableUpdate?: UpdateReleaseInfo
   /** 仅延后当前版本的提示；不会永久忽略更新。 */

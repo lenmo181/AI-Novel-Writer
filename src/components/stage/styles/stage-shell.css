@@ -82,3 +82,107 @@
   color: var(--danger);
 }
 
+
+
+/* ===== 应用启动入场：印章盖下 → 颜料晕开 → 亮出书房 ===== */
+.app-intro {
+  position: fixed;
+  inset: 0;
+  z-index: 10005;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: var(--s-4);
+  background:
+    radial-gradient(1100px 720px at 6% -8%, color-mix(in srgb, var(--paint-ochre) 10%, transparent), transparent 62%),
+    radial-gradient(920px 640px at 98% 10%, color-mix(in srgb, var(--paint-azure) 9%, transparent), transparent 58%),
+    var(--frame);
+  animation: app-intro-veil .5s ease both 1.05s, app-intro-veil-out .55s ease both 1.15s;
+  pointer-events: none;
+}
+
+.app-intro-wash {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(4px);
+  pointer-events: none;
+}
+
+.app-intro-wash--a {
+  width: 300px; height: 300px; left: calc(50% - 320px); top: calc(50% - 200px);
+  background: radial-gradient(circle, color-mix(in srgb, var(--paint-azure) 22%, transparent), transparent 70%);
+  animation: app-intro-drift 2.4s ease-in-out infinite alternate;
+}
+
+.app-intro-wash--b {
+  width: 340px; height: 340px; left: calc(50% + 40px); top: calc(50% - 60px);
+  background: radial-gradient(circle, color-mix(in srgb, var(--paint-vermilion) 18%, transparent), transparent 70%);
+  animation: app-intro-drift 3s ease-in-out infinite alternate-reverse;
+}
+
+.app-intro-seal {
+  display: grid;
+  place-items: center;
+  width: 72px; height: 72px;
+  border-radius: 14px;
+  background: var(--paint-vermilion);
+  color: var(--paper);
+  font: 700 40px/1 var(--font-display);
+  box-shadow: 0 14px 40px -14px color-mix(in srgb, var(--paint-vermilion) 70%, transparent);
+  animation: app-intro-seal .7s cubic-bezier(.34, 1.56, .64, 1) both .1s;
+}
+
+.app-intro-name {
+  margin: 0;
+  font: 600 24px/1.3 var(--font-display);
+  letter-spacing: .12em;
+  color: var(--ink);
+  animation: app-intro-fade .6s ease both .4s;
+}
+
+.app-intro-name i {
+  font-style: italic;
+  font-family: var(--font-num);
+  letter-spacing: .02em;
+  background: linear-gradient(90deg, var(--paint-azure), var(--paint-vermilion), var(--paint-azure));
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: app-intro-shine 3s linear infinite;
+}
+
+@keyframes app-intro-seal {
+  from { transform: scale(.5) rotate(-8deg); opacity: 0; }
+  60% { transform: scale(1.1) rotate(1.5deg); opacity: 1; }
+  to { transform: scale(1) rotate(0); opacity: 1; }
+}
+
+@keyframes app-intro-fade {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes app-intro-drift {
+  from { transform: translate(0, 0) scale(1); }
+  to { transform: translate(-30px, 22px) scale(1.15); }
+}
+
+@keyframes app-intro-shine {
+  to { background-position: 200% center; }
+}
+
+/* 盖章完成：整层向后晕开并淡出，露出底下的书房 */
+@keyframes app-intro-veil {
+  from { opacity: 1; }
+  to { opacity: 1; }
+}
+
+@keyframes app-intro-veil-out {
+  from { opacity: 1; transform: scale(1); }
+  to { opacity: 0; transform: scale(1.04); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-intro, .app-intro * { animation-duration: .01s !important; animation-iteration-count: 1 !important; }
+}

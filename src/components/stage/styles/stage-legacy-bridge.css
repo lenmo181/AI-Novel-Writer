@@ -12,7 +12,7 @@
   --stage-legacy-accent: color-mix(in srgb, var(--accent) 55%, var(--frame));
 }
 
-.stage-shell :where(.stage-content, .stage-library, .stage-sheet-slot, .stage-assistant, .stage-set-legacy), .pi-overlay-host {
+.stage-shell :where(.stage-content, .stage-library, .stage-sheet-slot, .stage-assistant, .stage-set-legacy, .stage-fallback), .pi-overlay-host {
   --color-bg: var(--surface);
   --color-sidebar: var(--surface-2);
   --color-panel: var(--surface-2);
@@ -23,6 +23,7 @@
   --color-text-muted: var(--ink-3);
   --color-border: var(--rule-strong);
   --color-accent: var(--stage-legacy-accent);
+  --color-accent-ink: var(--accent-ink);
   --color-accent-rgb: 139, 124, 255;
   --color-success: var(--ok);
   --color-success-text: var(--ok);
@@ -31,6 +32,13 @@
   --color-warning-text: var(--warn);
   --color-error: var(--danger);
   --color-error-text: var(--danger);
+  /* 语义色的浅底与描线：给旧组件里 bg-red-500/10 一类的浅色提示底换用 */
+  --color-success-soft: var(--ok-soft);
+  --color-success-line: color-mix(in srgb, var(--ok) 45%, transparent);
+  --color-warning-soft: var(--warn-soft);
+  --color-warning-line: color-mix(in srgb, var(--warn) 45%, transparent);
+  --color-error-soft: var(--danger-soft);
+  --color-error-line: var(--danger-line);
   --color-info: var(--accent);
   --color-editor-bg: var(--paper);
   --color-editor-caret: var(--accent);
@@ -42,10 +50,10 @@
   --shadow-popover: var(--shadow-pop);
 }
 
-.stage-shell[data-theme='light'] :where(.stage-content, .stage-library, .stage-sheet-slot, .stage-assistant, .stage-set-legacy) {
+.stage-shell[data-theme='light'] :where(.stage-content, .stage-library, .stage-sheet-slot, .stage-assistant, .stage-set-legacy, .stage-fallback) {
   --color-accent-rgb: 44, 74, 140;
 }
 
-.stage-shell[data-theme='dark'] :where(.stage-content, .stage-library, .stage-sheet-slot, .stage-assistant, .stage-set-legacy) {
+.stage-shell[data-theme='dark'] :where(.stage-content, .stage-library, .stage-sheet-slot, .stage-assistant, .stage-set-legacy, .stage-fallback) {
   --color-accent-rgb: 139, 124, 255;
 }

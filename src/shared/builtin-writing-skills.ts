@@ -112,6 +112,8 @@ When a plot outline is generated in batches, treat every batch as a resumable tr
 
 ## During generation
 - Every chapter needs a concrete event, character choice, resistance, result, and next hook.
+- Every chapter advances the main line: new information, new goals, new conflict, or new cost. No treading water and no repeating plot patterns already written.
+- Introduce new characters as the plot moves (state their identity and role) and extend the world with new settings; never let one small cast dominate several chapters in a row, and keep new settings consistent with author facts.
 - Generate only the requested range. Do not prewrite later batches or emit “continue generating” text.
 - Check chapterNumber before returning: it must increase without gaps from start to end.
 

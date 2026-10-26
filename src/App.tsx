@@ -176,8 +176,9 @@ export default function App() {
     <>
       <StageRoot theme={resolvedTheme} exitGuard={exitGuard}>
         <StageShell theme={resolvedTheme} />
+        {/* 弹窗要挂在纸墨作用域里才能取到令牌；StageRoot 之内、外壳之后。 */}
+        <UpdateNotifier />
       </StageRoot>
-      <UpdateNotifier />
       {globalDialogs}
     </>
   )

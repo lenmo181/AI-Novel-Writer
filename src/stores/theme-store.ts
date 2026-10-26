@@ -160,6 +160,10 @@ export const useThemeStore = createThemeStore()
 /** 深色时给根元素加 .dark：纸墨作用域之外的旧颜色变量与 Tailwind 的 dark 变体靠它切换。 */
 function applyTheme(theme: Theme) {
   document.documentElement.classList.toggle('dark', theme === 'dark')
+  // 把主题镜像进主进程 config.json：下次启动主进程按它定窗口首帧底色，浅色用户不再闪深色帧。
+  if (ipc.isElectron) {
+    void ipc.invoke('config:set', { colorTheme: theme }).catch(() => {})
+  }
 }
 
 /**

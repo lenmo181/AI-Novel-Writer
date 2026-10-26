@@ -152,6 +152,7 @@ describe('流程脊', () => {
         onStage={stage => spy('stage', stage)}
         onChapter={chapter => spy('chapter', chapter)}
         onResource={page => spy('resource', page)}
+        onExport={() => spy('export')}
         onSettings={() => spy('settings')}
       />,
     ))
@@ -191,7 +192,7 @@ describe('流程脊', () => {
     const partial = facts({ config: { ...READY_CONFIG, totalChapters: 100 }, blueprints: blueprints(20) })
     await act(async () => root!.render(
       <StageSpine stages={deriveStages(partial)} chapters={deriveChapters(partial)} location={null}
-        onStage={() => undefined} onChapter={() => undefined} onResource={() => undefined} onSettings={() => undefined} />,
+        onStage={() => undefined} onChapter={() => undefined} onResource={() => undefined} onExport={() => undefined} onSettings={() => undefined} />,
     ))
     const blueprint = host.querySelector('[data-stage="blueprint"]')!
     expect([blueprint.getAttribute('data-state'), blueprint.querySelector('.stage-row-meta')?.textContent]).toEqual(['done', '20 / 100 章'])
@@ -205,7 +206,7 @@ describe('流程脊', () => {
     const unplanned = facts({ config: { ...READY_CONFIG, totalChapters: 0 }, blueprints: [], drafts: { 1: [draft(1, 1, 'finalized')], 2: [draft(2, 1, 'draft')] } })
     await act(async () => root!.render(
       <StageSpine stages={deriveStages(unplanned)} chapters={deriveChapters(unplanned)} location={{ kind: 'stage', stage: 'manuscript', chapter: 2 }}
-        onStage={() => undefined} onChapter={() => undefined} onResource={() => undefined} onSettings={() => undefined} />,
+        onStage={() => undefined} onChapter={() => undefined} onResource={() => undefined} onExport={() => undefined} onSettings={() => undefined} />,
     ))
     expect(host.querySelector('[data-stage="manuscript"] .stage-row-meta')?.textContent).toBe('1 章定稿')
     expect([...host.querySelectorAll('.stage-chapter-title')].map(node => node.textContent)).toEqual(['第 1 章', '第 2 章'])
@@ -230,7 +231,7 @@ describe('流程脊', () => {
   it('章节列表晚于当前章渲染时，当前章也滚进列表可视区', async () => {
     const many = facts({ config: { ...READY_CONFIG, totalChapters: 80 }, blueprints: blueprints(80) })
     const props = { stages: deriveStages(many), location: { kind: 'stage', stage: 'manuscript', chapter: 70 } as const,
-      onStage: () => undefined, onChapter: () => undefined, onResource: () => undefined, onSettings: () => undefined }
+      onStage: () => undefined, onChapter: () => undefined, onResource: () => undefined, onExport: () => undefined, onSettings: () => undefined }
     host = document.createElement('div')
     host.className = 'paper-ink stage-shell'
     host.style.cssText = 'height: 640px; width: 1280px;'
@@ -257,7 +258,7 @@ describe('流程脊', () => {
       const meta = async (total: number) => {
         const one = facts({ config: { ...READY_CONFIG, totalChapters: total }, blueprints: blueprints(1) })
         await act(async () => root!.render(<StageSpine stages={deriveStages(one)} chapters={deriveChapters(one)} location={null}
-          onStage={() => undefined} onChapter={() => undefined} onResource={() => undefined} onSettings={() => undefined} />))
+          onStage={() => undefined} onChapter={() => undefined} onResource={() => undefined} onExport={() => undefined} onSettings={() => undefined} />))
         return host!.querySelector('[data-stage="blueprint"] .stage-row-meta')?.textContent
       }
       expect(await meta(1)).toBe('1 chapter')

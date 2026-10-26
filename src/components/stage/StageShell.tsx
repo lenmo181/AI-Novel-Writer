@@ -12,6 +12,7 @@ import ClearProjectDataDialog from '../dialogs/ClearProjectDataDialog'
 import { leaveSettingsThen, openProjectFolder } from '../settings/unsaved-settings'
 import type { MenuGroupSpec } from '../ui/Menu'
 import NewWorkDialog from './library/NewWorkDialog'
+import { APP_BRAND } from '../../shared/brand'
 import { SETTINGS_PAGES } from './settings/settings-pages'
 import { preloadStagePages } from './stage-pages'
 import StagePalette from './StagePalette'
@@ -57,6 +58,10 @@ export default function StageShell({ theme }: { theme: Theme }) {
   const [root, setRoot] = useState<HTMLDivElement | null>(null)
   const [clearOpen, setClearOpen] = useState(false)
   const [assistantOpen, setAssistantOpen] = useState(true)
+  // 每次启动应用的一次性入场：印章盖下、晕开、显出书房。会话内只放一次，切作品不再打扰。
+  const [intro, setIntro] = useState(() => {
+    try { return sessionStorage.getItem('pagekin:intro') !== 'done' } catch { return true }
+  })
   const view = useStageView()
 
   useStageWorkRefresh()
@@ -71,6 +76,16 @@ export default function StageShell({ theme }: { theme: Theme }) {
     const handle = requestIdleCallback(preloadStagePages, { timeout: 2000 })
     return () => cancelIdleCallback(handle)
   }, [])
+
+  useEffect(() => {
+    if (!intro) return
+    const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+    const timer = setTimeout(() => {
+      try { sessionStorage.setItem('pagekin:intro', 'done') } catch { /* 会话不可写也只影响下次多看一次 */ }
+      setIntro(false)
+    }, reduced ? 300 : 1600)
+    return () => clearTimeout(timer)
+  }, [intro])
 
   // 设置页属于打开它时的书房或作品；在书房与作品之间切换时收起。
   const settingsOpen = useLayoutStore(s => s.settingsOpen)
@@ -130,11 +145,14 @@ export default function StageShell({ theme }: { theme: Theme }) {
       ...(hasProject ? [
         paletteItem('action', { id: 'library', label: text('回到书房', 'Back to library'), run: backToLibrary }),
         paletteItem('action', { id: 'run', label: text('运行侧页', 'Run sheet'), keywords: 'AI 输出 任务 日志', run: () => navigate({ kind: 'run', facet: 'output' }) }),
+        paletteItem('action', { id: 'review-center', label: text('全文审稿', 'Full review'), keywords: '审稿 问题 修复 review', run: () => navigate({ kind: 'resource', page: 'review-center' }) }),
         paletteItem('action', { id: 'export', label: text('导出', 'Export'), run: () => useLayoutStore.getState().openExport() }),
         paletteItem('action', { id: 'backup', label: text('项目备份', 'Project backup'), run: () => navigate({ kind: 'settings', section: 'backup' }) }),
       ] : []),
       ...(hasProject && !library ? [paletteItem('action', { id: 'focus', label: text('沉浸写作', 'Focus mode'), run: toggleFocus })] : []),
-      paletteItem('action', { id: 'settings', label: text('设置', 'Settings'), run: () => navigate({ kind: 'settings', section: 'llm' }) }),
+      paletteItem('action', { id: 'models', label: text('模型与任务', 'Models & tasks'), keywords: 'AI 模型 接口 连接测试', run: () => navigate({ kind: 'settings', section: 'llm' }) }),
+      paletteItem('action', { id: 'prompts', label: text('提示词与设定', 'Prompts & rules'), keywords: '提示词 模板 Skills 写作规则', run: () => navigate({ kind: 'settings', section: 'prompts' }) }),
+      paletteItem('action', { id: 'settings', label: text('设置', 'Settings'), run: () => navigate({ kind: 'settings', section: 'appearance' }) }),
     ]
     return [...go, ...chapters, ...references, ...actions, ...(library ? books : [])]
   }, [view.stages, view.chapters, hasProject, library, text, toggleFocus, recentProjects])
@@ -170,11 +188,14 @@ export default function StageShell({ theme }: { theme: Theme }) {
           <StageRail
             library={library}
             location={view.location}
-            settingsOpen={settingsOpen}
+            settingsSection={settingsOpen ? settingsSection : null}
             onLibrary={backToLibrary}
             onStage={stage => navigate({ kind: 'stage', stage })}
             onRun={() => navigate({ kind: 'run', facet: 'output' })}
-            onSettings={() => navigate({ kind: 'settings', section: 'llm' })}
+            onReviewCenter={() => navigate({ kind: 'resource', page: 'review-center' })}
+            onModels={() => navigate({ kind: 'settings', section: 'llm' })}
+            onPrompts={() => navigate({ kind: 'settings', section: 'prompts' })}
+            onSettings={() => navigate({ kind: 'settings', section: 'appearance' })}
           />
         )}
         {!library && !focus && (
@@ -183,15 +204,25 @@ export default function StageShell({ theme }: { theme: Theme }) {
             chapters={view.chapters}
             location={view.location}
             settingsOpen={settingsOpen}
+            review={view.review}
             onStage={stage => navigate({ kind: 'stage', stage })}
             onChapter={chapterNumber => navigate({ kind: 'chapter', chapterNumber })}
             onResource={page => navigate({ kind: 'resource', page })}
-            onSettings={() => navigate({ kind: 'settings', section: 'llm' })}
+            onExport={() => useLayoutStore.getState().openExport()}
+            onSettings={() => navigate({ kind: 'settings', section: 'appearance' })}
           />
         )}
         <StageWorkspace library={library} focus={focus} />
         {!library && !focus && assistantOpen && <StageAssistant onClose={() => setAssistantOpen(false)} />}
       </div>
+      {intro && (
+        <div className="app-intro" aria-hidden="true">
+          <span className="app-intro-wash app-intro-wash--a" />
+          <span className="app-intro-wash app-intro-wash--b" />
+          <span className="app-intro-seal" aria-hidden="true">{APP_BRAND.zhName.slice(0, 1)}</span>
+          <p className="app-intro-name">{APP_BRAND.zhName} <i>{APP_BRAND.enName}</i></p>
+        </div>
+      )}
       <StagePalette mode={palette} items={paletteItems} container={root} onClose={() => useStageStore.setState({ palette: null })} />
       <ClearProjectDataDialog open={clearOpen} onClose={() => setClearOpen(false)} onCleared={() => refreshStageWork(text)} />
       <NewWorkDialog />

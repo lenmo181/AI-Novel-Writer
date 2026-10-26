@@ -1,4 +1,4 @@
-import { BookOpen, FilePen, GitBranch, Library, ListChecks, Settings, Sparkles, Workflow, type LucideIcon } from 'lucide-react'
+import { BookOpen, FilePen, GitBranch, Library, ListChecks, BookOpenCheck, Settings, Sparkles, Workflow, Wand2, Cpu, type LucideIcon } from 'lucide-react'
 import { useLocaleStore } from '../../stores/locale-store'
 import type { WorkStage } from '../../stores/navigation/navigation-intents'
 import type { StageLocation } from '../../stores/navigation/stage-progress'
@@ -6,10 +6,14 @@ import type { StageLocation } from '../../stores/navigation/stage-progress'
 interface StageRailProps {
   library: boolean
   location: StageLocation | null
-  settingsOpen?: boolean
+  /** 设置页当前分区：底部三个设置入口的选中态由它区分；null 表示设置没开。 */
+  settingsSection?: string | null
   onLibrary: () => void
   onStage: (stage: WorkStage) => void
   onRun: () => void
+  onReviewCenter: () => void
+  onModels: () => void
+  onPrompts: () => void
   onSettings: () => void
 }
 
@@ -25,7 +29,7 @@ type RailItem = {
  * The application-level rail. StageSpine remains the detailed, project-local
  * navigation; this rail keeps the global destinations visible at a glance.
  */
-export default function StageRail({ library, location, settingsOpen, onLibrary, onStage, onRun, onSettings }: StageRailProps) {
+export default function StageRail({ library, location, settingsSection, onLibrary, onStage, onRun, onReviewCenter, onModels, onPrompts, onSettings }: StageRailProps) {
   const text = useLocaleStore(s => s.text)
   const activeStage = location?.kind === 'stage' ? location.stage : null
 
@@ -36,6 +40,7 @@ export default function StageRail({ library, location, settingsOpen, onLibrary, 
       { id: 'architecture', label: ['架构', 'Architecture'] as [string, string], icon: GitBranch, onClick: () => onStage('architecture'), active: activeStage === 'architecture' },
       { id: 'blueprint', label: ['蓝图', 'Blueprint'] as [string, string], icon: ListChecks, onClick: () => onStage('blueprint'), active: activeStage === 'blueprint' },
       { id: 'manuscript', label: ['正文', 'Manuscript'] as [string, string], icon: FilePen, onClick: () => onStage('manuscript'), active: activeStage === 'manuscript' },
+      { id: 'review-center', label: ['全文审稿', 'Full review'] as [string, string], icon: BookOpenCheck, onClick: onReviewCenter, active: location?.kind === 'resource' && location.page === 'review-center' },
       { id: 'run', label: ['AI 运行', 'AI runs'] as [string, string], icon: Sparkles, onClick: onRun, active: false },
     ] : []),
   ]
@@ -76,7 +81,29 @@ export default function StageRail({ library, location, settingsOpen, onLibrary, 
         <button
           type="button"
           className="stage-rail-item"
-          aria-current={settingsOpen ? 'page' : undefined}
+          aria-current={settingsSection === 'llm' || settingsSection === 'embedding' ? 'page' : undefined}
+          aria-label={text('模型与任务', 'Models & tasks')}
+          title={text('模型与任务', 'Models & tasks')}
+          onClick={onModels}
+        >
+          <Cpu size={18} strokeWidth={1.75} aria-hidden="true" />
+          <span>{text('模型', 'Models')}</span>
+        </button>
+        <button
+          type="button"
+          className="stage-rail-item"
+          aria-current={settingsSection === 'prompts' || settingsSection === 'skills' ? 'page' : undefined}
+          aria-label={text('提示词与设定', 'Prompts & rules')}
+          title={text('提示词与设定', 'Prompts & rules')}
+          onClick={onPrompts}
+        >
+          <Wand2 size={18} strokeWidth={1.75} aria-hidden="true" />
+          <span>{text('提示词', 'Prompts')}</span>
+        </button>
+        <button
+          type="button"
+          className="stage-rail-item"
+          aria-current={settingsSection !== null && settingsSection !== 'llm' && settingsSection !== 'embedding' && settingsSection !== 'prompts' && settingsSection !== 'skills' ? 'page' : undefined}
           aria-label={text('设置', 'Settings')}
           title={text('设置', 'Settings')}
           onClick={onSettings}

@@ -68,7 +68,7 @@ beforeEach(async () => {
   useProjectStore.setState({ currentProject: chapterProject() })
   setActiveProjectSessionContext(SESSION)
   useEditorStore.setState({ tabs: [], activeTabId: null, draftLedgers: {} })
-  useStageStore.setState({ work: { session: SESSION, architecture: {}, blueprints: [{ chapterNumber: 3, title: BLUEPRINT.title }] }, chapterRequest: null, writeRequest: null, sheet: null })
+  useStageStore.setState({ work: { session: SESSION, architecture: {}, blueprints: [{ chapterNumber: 3, title: BLUEPRINT.title }], review: { reviewed: 0, total: 0, openIssues: 0 } }, chapterRequest: null, writeRequest: null, sheet: null })
   useLLMStore.setState({ models: [generationModel('grok')], defaultModelId: 'grok', loaded: true })
   useWorkflowStore.setState({ activeRuns: [], history: [], startWorkflow: vi.fn(async () => 'run') as never, addLog: vi.fn() as never })
 })

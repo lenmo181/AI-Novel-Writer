@@ -20,15 +20,33 @@ export interface ElectronUpdaterLike {
   on(event: string, listener: (...args: unknown[]) => void): unknown
 }
 
+/**
+ * electron-updater 的 releaseNotes 可能是字符串，也可能是按版本分段的 [{version, note}] 数组；
+ * 统一拍平成一段文本交给弹窗渲染。
+ */
+function normalizeReleaseNotes(value: unknown): string | undefined {
+  if (typeof value === 'string') return value
+  if (!Array.isArray(value)) return undefined
+  const notes = value.map(item => {
+    if (typeof item === 'string') return item
+    if (item && typeof item === 'object' && typeof (item as Record<string, unknown>).note === 'string') {
+      return (item as Record<string, unknown>).note as string
+    }
+    return ''
+  }).filter(note => note.trim())
+  return notes.length ? notes.join('\n\n') : undefined
+}
+
 function mapReleaseInfo(value: unknown): UpdateReleaseInfo | undefined {
   if (!value || typeof value !== 'object') return undefined
   const info = value as Record<string, unknown>
   if (typeof info.version !== 'string') return undefined
 
+  const releaseNotes = normalizeReleaseNotes(info.releaseNotes)
   return {
     version: info.version,
     ...(typeof info.releaseName === 'string' ? { releaseName: info.releaseName } : {}),
-    ...(typeof info.releaseNotes === 'string' ? { releaseNotes: info.releaseNotes } : {}),
+    ...(releaseNotes !== undefined ? { releaseNotes } : {}),
     ...(typeof info.releaseDate === 'string' ? { releaseDate: info.releaseDate } : {}),
   }
 }

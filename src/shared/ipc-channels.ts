@@ -93,6 +93,44 @@ export interface ConfigChannels {
   }
 }
 
+// ===== 作品封面 =====
+export interface CoverImagePayload {
+  dataBase64: string
+  mimeType: string
+}
+
+export interface CoverGenerateRequest {
+  projectId: string
+  name: string
+  /** 作者补充的风格描述；空串表示完全交给模型发挥。 */
+  hint?: string
+  /** 封面上是否渲染书名文字。 */
+  showTitle: boolean
+  /** 图像模型名，与文本模型同网关。 */
+  imageModel: string
+  /** 生成提示词用的文本模型；缺省时直接用书名与补充描述拼提示词。 */
+  modelId?: string
+}
+
+export interface CoverChannels {
+  'cover:generate': {
+    args: [request: CoverGenerateRequest]
+    return: { success: boolean; image?: CoverImagePayload; error?: string }
+  }
+  'cover:save': {
+    args: [projectId: string, image: CoverImagePayload]
+    return: { success: boolean; error?: string }
+  }
+  'cover:get': {
+    args: [projectId: string]
+    return: { success: boolean; image?: CoverImagePayload; error?: string }
+  }
+  'cover:remove': {
+    args: [projectId: string]
+    return: { success: boolean; error?: string }
+  }
+}
+
 // ===== 应用更新 =====
 export interface UpdateChannels {
   'update:get-state': {
@@ -118,6 +156,11 @@ export interface UpdateChannels {
   'update:quit-and-install': {
     args: []
     return: UpdateActionResponse
+  }
+  /** 读取随包发布的更新日志（CHANGELOG.md），「关于与更新」页面渲染。 */
+  'update:get-changelog': {
+    args: []
+    return: { success: boolean; markdown?: string }
   }
 }
 
@@ -168,6 +211,9 @@ export interface ModelProviderResourceChannels {
 
 export interface GlobalConfig {
   theme: string
+  /** 渲染进程外观主题的镜像：主进程只在创建窗口时读它定首帧底色。 */
+  colorTheme?: 'light' | 'dark'
+
   outlineTargetUnits?: number
   blueprintTargetUnits?: number
   locale?: Locale
@@ -851,6 +897,8 @@ import type {
 } from '../../electron/repositories/finalization-repository'
 import type { RevisionMeta, RevisionFull } from '../../electron/repositories/revision-repository'
 import type { ReviewMeta, ReviewFull } from '../../electron/repositories/review-repository'
+import type { ReviewCenterChapter } from './review-center'
+import type { ChapterFactsEntry } from '../../electron/services/chapter-facts-overview'
 import type { PostProcessRunData, PostProcessStepData } from '../../electron/repositories/post-process-repository'
 import type {
   CharacterRosterCommitReceipt,
@@ -1139,6 +1187,9 @@ export interface DatabaseChannels {
 
   // 6. reviews
   'db:review-create': { args: [params: { baseDraftId: number; reviewIndex?: number; content: string; expectedSource?: ExpectedDraftSource; reviewCycleId?: string }, expectedProjectPath: string]; return: { success: boolean; id?: number; reviewIndex?: number; errorCode?: SourceDraftGuardErrorCode; error?: string } }
+  'db:review-overview': { args: [expectedProjectPath: string]; return: { success: boolean; chapters?: ReviewCenterChapter[]; error?: string } }
+  /** 一批稿的审稿/修稿事实，一次聚合返回；取代逐稿 4~7 个 IPC 的旧路径。 */
+  'db:chapter-facts-overview': { args: [draftIds: number[], expectedProjectPath: string]; return: ChapterFactsEntry[] }
   'db:review-list': { args: [baseDraftId: number, expectedProjectPath: string]; return: ReviewMeta[] }
   'db:review-get-latest': { args: [baseDraftId: number, expectedProjectPath: string]; return: ReviewFull | null }
   'db:review-get-full': { args: [id: number, expectedProjectPath: string]; return: ReviewFull | null }
@@ -1313,7 +1364,7 @@ export interface MCPChannels {
 }
 
 // ===== 合并所有频道 =====
-export type AllInvokeChannels = LegacyRosterGenerationChannels & CharacterAvatarChannels & CloudBackupChannels & CmCloudChannels & GraphGenerationChannels & FinalizationGenerationChannels & EditorInlineGenerationChannels & ImportGenerationChannels & AgentGenerationChannels & ReviewRevisionGenerationInvokeChannels & FinalizedCharacterGenerationChannels & CharacterProposalChannels & GenerationOwnerChannels & StartupChannels & WindowChannels & OfficialHomepageChannels & ModelProviderResourceChannels & ConfigChannels & UpdateChannels & ProjectChannels & FileChannels & AppDataChannels & LLMChannels & DatabaseChannels & KnowledgeBaseChannels & ChapterLifecycleChannels & ImportChannels & MCPChannels
+export type AllInvokeChannels = LegacyRosterGenerationChannels & CharacterAvatarChannels & CloudBackupChannels & CmCloudChannels & GraphGenerationChannels & FinalizationGenerationChannels & EditorInlineGenerationChannels & ImportGenerationChannels & AgentGenerationChannels & ReviewRevisionGenerationInvokeChannels & FinalizedCharacterGenerationChannels & CharacterProposalChannels & GenerationOwnerChannels & StartupChannels & WindowChannels & OfficialHomepageChannels & ModelProviderResourceChannels & ConfigChannels & CoverChannels & UpdateChannels & ProjectChannels & FileChannels & AppDataChannels & LLMChannels & DatabaseChannels & KnowledgeBaseChannels & ChapterLifecycleChannels & ImportChannels & MCPChannels
 export type AllEventChannels = GenerationOwnerEvents & LLMStreamEvents & UpdateStateEvents & WindowEvents
 
 /** 提取 invoke 频道名 */

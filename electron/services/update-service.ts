@@ -68,6 +68,9 @@ export interface UpdateServiceOptions {
   now?: () => Date
 }
 
+/** 自动检查的频率上限：每小时一次；手动检查不受限。 */
+export const AUTOMATIC_CHECK_INTERVAL_MS = 60 * 60 * 1000
+
 function localCalendarDate(now: Date): string {
   const year = now.getFullYear()
   const month = String(now.getMonth() + 1).padStart(2, '0')
@@ -189,7 +192,7 @@ export function isHigherStableVersion(candidate: string, current: string): boole
 }
 
 /**
- * 更新服务的最小公共行为：在已打包的应用中，成功自动检查每天最多一次；
+ * 更新服务的最小公共行为：在已打包的应用中，成功自动检查每小时最多一次；
  * 用户手动检查始终可以绕过该频率限制。
  */
 export class UpdateService {
@@ -262,9 +265,13 @@ export class UpdateService {
     const now = this.now()
     const today = localCalendarDate(now)
     const preferences = this.readPreferences()
-    // 无法读取或保存检查日期时，不自动联网，避免每次重启都绕过“每天一次”的上限。
+    // 无法读取或保存检查时间时，不自动联网，避免每次重启都绕过“每小时一次”的上限。
     if (!preferences) return this.response({ success: false, checked: false })
-    if (preferences.lastAutomaticCheckDate === today) {
+    const lastAutomaticCheckAt = preferences.lastAutomaticCheckAt
+      ? Date.parse(preferences.lastAutomaticCheckAt)
+      : Number.NaN
+    if (Number.isFinite(lastAutomaticCheckAt)
+      && now.getTime() - lastAutomaticCheckAt < AUTOMATIC_CHECK_INTERVAL_MS) {
       return this.response({ success: true, checked: false })
     }
 
@@ -277,6 +284,8 @@ export class UpdateService {
         this.writePreferences({
           ...(this.readPreferences() ?? preferences),
           lastCheckedAt: now.toISOString(),
+          lastAutomaticCheckAt: now.toISOString(),
+          // 旧版本只认日历日；继续写入让它降级后也不会更频繁地自动联网。
           lastAutomaticCheckDate: today,
         })
       }

@@ -24,6 +24,8 @@ export interface UpdateControllerDependencies {
   ipc: UpdateIpcRegistrar
   /** 由主进程提供，负责向已有窗口广播状态。 */
   publish(state: UpdateState): void
+  /** 读取随包发布的更新日志；缺省时界面只显示不可用说明。 */
+  readChangelog?: () => string | null
 }
 
 function toRendererState(state: UpdateState): UpdateState {
@@ -40,7 +42,7 @@ function toRendererState(state: UpdateState): UpdateState {
  */
 export function registerUpdateController(
   service: UpdateServiceFacade,
-  { ipc, publish }: UpdateControllerDependencies,
+  { ipc, publish, readChangelog }: UpdateControllerDependencies,
 ): () => void {
   ipc.handle('update:get-state', async () => service.getState())
   ipc.handle('update:check', async () => service.checkManually())
@@ -51,6 +53,10 @@ export function registerUpdateController(
     return service.deferReminder(delay as UpdateReminderDelay)
   })
   ipc.handle('update:quit-and-install', async () => service.requestInstall())
+  ipc.handle('update:get-changelog', async () => {
+    const markdown = readChangelog?.() ?? null
+    return markdown ? { success: true, markdown } : { success: false }
+  })
 
   return service.subscribe((state) => publish(toRendererState(state)))
 }

@@ -1,6 +1,5 @@
 import type { DraftMeta } from '../../services/draft-index'
 import type { NovelConfig } from '../../shared/ipc-channels'
-import type { ReviewCycleProjection } from '../../shared/review-cycle'
 import type { EditorTab } from '../editor-store'
 import type { WorkflowRun } from '../workflow-store'
 import type { ResourcePage, WorkStage } from './navigation-intents'
@@ -33,17 +32,9 @@ export type StageStatus =
 /** 一章所处的位置：待写、草稿（待审稿）、已审稿（待修稿）、有修稿待合并、已修稿（待定稿）、定稿。 */
 export type ChapterPhase = 'todo' | 'draft' | 'reviewed' | 'merge' | 'revised' | 'final'
 
-/** 一稿走到哪一步要看的审稿与修稿记录，由 chapter-facts 读出；流程脊与单章视图读同一份。 */
-export interface ChapterFacts {
-  /** 可以合并的待合并修稿 id，按生成先后。 */
-  mergeable: readonly number[]
-  /** 不能再合并、只能查看或丢弃的待合并修稿：edited 是生成后正文或稿状态变了，unsourced 是旧修稿没有记下生成时的源稿。 */
-  stale: readonly { id: number; reason: 'edited' | 'unsourced' }[]
-  /** 这一稿最新的审稿；cycleStatus 是它所属复验周期的修稿进度，旧审稿与合并后的自动复验没有周期。 */
-  latestReview: { createdAt: string; cycleStatus: ReviewCycleProjection['revisionStatus'] | null } | null
-  /** 最近一次合并修稿的时间；没合并过为 null。 */
-  lastMergedAt: string | null
-}
+/** 一稿走到哪一步要看的审稿与修稿记录；类型定义在 shared，主进程聚合与渲染端共用同一份。 */
+import type { ChapterFacts } from '../../shared/chapter-facts'
+export type { ChapterFacts }
 
 /**
  * 一稿（未归档）走到哪一步。数据库里没有代码把草稿设为 reviewed：审稿只新增审稿记录，合并修稿才把稿改成 revised，
@@ -197,6 +188,7 @@ const TAB_LOCATION: Record<EditorTab['type'], StageLocation> = {
   'narrative-thread': { kind: 'resource', page: 'plot' },
   knowledge: { kind: 'resource', page: 'knowledge' },
   'version-history': { kind: 'resource', page: 'history' },
+  'review-center': { kind: 'resource', page: 'review-center' },
 }
 
 /** 当前标签属于哪个阶段或资料页；正文类标签带上章号。 */

@@ -146,7 +146,7 @@ export default function PromptSettings() {
   return (
     <div className="settings-prompt-page space-y-2" key={refreshKey}>
       {globalLoadError && (
-        <div className="px-3 py-2 rounded-lg text-xs bg-red-500/10 text-[var(--color-error-text)] border border-red-500/20">
+        <div className="px-3 py-2 rounded-lg text-xs bg-[var(--color-error-soft)] text-[var(--color-error-text)] border border-[var(--color-error-line)]">
           <AlertTriangle size={13} className="inline mr-1" />
           {globalLoadError}
         </div>
@@ -154,7 +154,7 @@ export default function PromptSettings() {
       {projectLoadError
         && projectLoadError.projectId === projectSession?.projectId
         && projectLoadError.leaseId === projectSession.leaseId && (
-        <div className="px-3 py-2 rounded-lg text-xs bg-red-500/10 text-[var(--color-error-text)] border border-red-500/20">
+        <div className="px-3 py-2 rounded-lg text-xs bg-[var(--color-error-soft)] text-[var(--color-error-text)] border border-[var(--color-error-line)]">
           <AlertTriangle size={13} className="inline mr-1" />
           {projectLoadError.message}
         </div>
@@ -411,7 +411,7 @@ function TemplateItem({
                     key={varName}
                     onClick={() => insertVariable(varName)}
                     title={text(desc, englishDescription)}
-                    className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[0.68rem] transition-colors hover:bg-[var(--color-accent)] hover:text-white outline-none focus:outline-none"
+                    className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[0.68rem] transition-colors hover:bg-[var(--color-accent)] hover:text-[var(--color-accent-ink)] outline-none focus:outline-none"
                     style={{
                       backgroundColor: 'var(--color-hover)',
                       color: 'var(--color-text-secondary)',
@@ -513,8 +513,8 @@ function TemplateItem({
               className={cn(
                 'text-xs px-3 py-1.5 rounded-lg',
                 saveResult.type === 'success'
-                  ? 'bg-green-500/10 text-[var(--color-success-text)] border border-green-500/20'
-                  : 'bg-red-500/10 text-[var(--color-error-text)] border border-red-500/20'
+                  ? 'bg-[var(--color-success-soft)] text-[var(--color-success-text)] border border-[var(--color-success-line)]'
+                  : 'bg-[var(--color-error-soft)] text-[var(--color-error-text)] border border-[var(--color-error-line)]'
               )}
             >
               {saveResult.type === 'success'

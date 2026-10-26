@@ -7,19 +7,20 @@
 .paper-ink {
   color-scheme: light;
 
-  --frame: #EEEDE8;
-  --sunken: rgba(23, 23, 26, .05);
-  --surface: #F7F6F2;
-  --surface-2: #F1F0EC;
+  /* 浅色基准：桌面比纸面深一档，纸片浮起来才明显；墨阶整体压深半档保证正文与小字在纸面上的对比度。 */
+  --frame: #EAE8E2;
+  --sunken: rgba(23, 23, 26, .055);
+  --surface: #F6F5F0;
+  --surface-2: #EFEEE8;
   --paper: #FFFEFB;
 
   --ink: #17171A;
-  --ink-2: #55555E;
-  --ink-3: #696972;
+  --ink-2: #52525C;
+  --ink-3: #666670;
   --ink-4: #A1A1A8;
-  --rule: rgba(23, 23, 26, .07);
-  --rule-strong: rgba(23, 23, 26, .14);
-  --track: rgba(23, 23, 26, .1);
+  --rule: rgba(23, 23, 26, .085);
+  --rule-strong: rgba(23, 23, 26, .165);
+  --track: rgba(23, 23, 26, .11);
 
   --accent: #2C4A8C;
   --accent-hover: #1F3870;
@@ -39,7 +40,7 @@
 
   --focus-ring: 0 0 0 2px var(--paper), 0 0 0 4px var(--accent);
   --shadow-button: 0 1px 2px rgba(23, 23, 26, .18);
-  --shadow-panel: 0 0 0 1px rgba(23, 23, 26, .07), 0 8px 24px -12px rgba(23, 23, 26, .16);
+  --shadow-panel: 0 0 0 1px rgba(23, 23, 26, .06), 0 12px 32px -16px rgba(23, 23, 26, .2);
   --shadow-pop: 0 0 0 1px rgba(23, 23, 26, .08), 0 16px 40px -12px rgba(23, 23, 26, .28);
   --shadow-seg: 0 1px 2px rgba(23, 23, 26, .12);
   --scrim: rgba(23, 23, 26, .35);
@@ -106,7 +107,36 @@
   --danger-hover: color-mix(in srgb, var(--danger) 86%, var(--ink));
   --danger-press: color-mix(in srgb, var(--danger) 74%, var(--ink));
 
-  background: var(--frame);
+  /* 油彩色板：创作流程每一步一个专属色相，背景与卡片晕染也从这里调。
+     命名取自传统绘画颜料：黛蓝、赭石、藤黄、朱砂、绛紫、石绿。 */
+  --paint-azure: #2C4A8C;
+  --paint-umber: #8A5A3B;
+  --paint-ochre: #B5761D;
+  --paint-vermilion: #B5473B;
+  --paint-plum: #7D5BA6;
+  --paint-jade: #4E7E6B;
+
+  /* 桌面底色带极淡的颜料晕染：左上暖黄、右上黛蓝、底下朱砂，像画布上未干透的底色。 */
+  --frame-wash:
+    radial-gradient(1100px 720px at 6% -8%, color-mix(in srgb, var(--paint-ochre) 9%, transparent), transparent 62%),
+    radial-gradient(920px 640px at 98% 10%, color-mix(in srgb, var(--paint-azure) 8%, transparent), transparent 58%),
+    radial-gradient(1200px 760px at 46% 110%, color-mix(in srgb, var(--paint-vermilion) 6%, transparent), transparent 62%);
+
+  /* 卡片顶沿的笔触条：像画框上沿的一道颜料高光。 */
+  --brush-stroke: linear-gradient(90deg,
+    color-mix(in srgb, var(--paint-azure) 62%, transparent),
+    color-mix(in srgb, var(--paint-vermilion) 55%, transparent) 38%,
+    color-mix(in srgb, var(--paint-ochre) 60%, transparent) 66%,
+    color-mix(in srgb, var(--paint-jade) 55%, transparent));
+
+  /* 书封图上的文字浮层：下深上浅的压暗渐变与白字轻影，两套主题通用。 */
+  --cover-scrim-strong: rgba(10, 10, 14, .62);
+  --cover-scrim-mid: rgba(10, 10, 14, .18);
+  --cover-scrim-fade: rgba(10, 10, 14, 0);
+  --cover-text-on-art: #FFFFFF;
+  --cover-text-shadow: 0 1px 6px rgba(10, 10, 14, .5);
+
+  background: var(--frame-wash), var(--frame);
   color: var(--ink);
   font: 400 var(--fs-13)/1.55 var(--font-ui);
   -webkit-font-smoothing: antialiased;
@@ -173,4 +203,17 @@
   --wash: color-mix(in srgb, var(--ink) 7%, transparent);
   --wash-strong: color-mix(in srgb, var(--ink) 12%, transparent);
   --danger-press: color-mix(in srgb, var(--danger) 80%, var(--frame));
+
+  /* 深色油彩：同一组色相提亮加饱和，晕染浓度也加大一档，深底上才看得见笔触。 */
+  --paint-azure: #8FA8E8;
+  --paint-umber: #C99A72;
+  --paint-ochre: #E0B15C;
+  --paint-vermilion: #E08A7A;
+  --paint-plum: #B39DE0;
+  --paint-jade: #7FC0A4;
+
+  --frame-wash:
+    radial-gradient(1100px 720px at 6% -8%, color-mix(in srgb, var(--paint-plum) 12%, transparent), transparent 62%),
+    radial-gradient(920px 640px at 98% 10%, color-mix(in srgb, var(--paint-azure) 11%, transparent), transparent 58%),
+    radial-gradient(1200px 760px at 46% 110%, color-mix(in srgb, var(--paint-ochre) 9%, transparent), transparent 62%);
 }

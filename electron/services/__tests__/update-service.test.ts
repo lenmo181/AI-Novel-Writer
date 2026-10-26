@@ -388,7 +388,9 @@ describe('UpdateService', () => {
   it('recovers a remembered release without pretending the prior-process installer is ready', async () => {
     const updater = new FakeUpdater({ updateInfo: { version: '0.2.7' } })
     const preferences = createPreferencesStore({
+      // 节流现在按“每小时一次”判断：记住检查时刻才会挡住启动时的自动复查。
       lastAutomaticCheckDate: '2026-07-25',
+      lastAutomaticCheckAt: '2026-07-25T09:00:00+08:00',
       availableUpdate: { version: '0.2.6', releaseName: 'v0.2.6' },
     })
     const service = new UpdateService({
@@ -838,6 +840,47 @@ describe('UpdateService', () => {
     expect(updater.checkCalls).toBe(0)
     await expect(service.checkManually()).resolves.toMatchObject({ success: true, checked: true })
     expect(updater.checkCalls).toBe(1)
+  })
+
+  it('skips automatic checks within an hour of the last one, then allows them again', async () => {
+    const updater = new FakeUpdater({ updateInfo: { version: '0.2.6' } })
+    let current = new Date('2026-07-25T09:00:00+08:00').getTime()
+    const service = new UpdateService({
+      updater,
+      currentVersion: '0.2.5',
+      isPackaged: true,
+      preferences: createPreferencesStore(),
+      now: () => new Date(current),
+    })
+
+    await expect(service.checkAutomatically()).resolves.toMatchObject({ success: true, checked: true })
+    expect(updater.checkCalls).toBe(1)
+
+    current += 30 * 60 * 1000
+    await expect(service.checkAutomatically()).resolves.toMatchObject({ success: true, checked: false })
+    expect(updater.checkCalls).toBe(1)
+
+    current += 31 * 60 * 1000
+    await expect(service.checkAutomatically()).resolves.toMatchObject({ success: true, checked: true })
+    expect(updater.checkCalls).toBe(2)
+  })
+
+  it('keeps writing the calendar day alongside the hourly stamp for older versions', async () => {
+    const updater = new FakeUpdater({ updateInfo: { version: '0.2.6' } })
+    const preferences = createPreferencesStore()
+    const service = new UpdateService({
+      updater,
+      currentVersion: '0.2.5',
+      isPackaged: true,
+      preferences,
+      now: () => new Date('2026-07-25T09:00:00+08:00'),
+    })
+
+    await service.checkAutomatically()
+    expect(preferences.read()).toMatchObject({
+      lastAutomaticCheckDate: '2026-07-25',
+      lastAutomaticCheckAt: new Date('2026-07-25T09:00:00+08:00').toISOString(),
+    })
   })
 
   it('reports a download-specific safe error for a manual download failure', async () => {

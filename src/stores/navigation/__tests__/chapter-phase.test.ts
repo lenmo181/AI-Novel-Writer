@@ -19,28 +19,30 @@ const db = vi.hoisted(() => ({
 
 vi.mock('../../../services/ipc-client', () => ({
   ipc: {
-    invokeWithProjectSession: async (_session: unknown, channel: string, id: number) => {
-      switch (channel) {
-        case 'db:revision-list': {
-          const listed = db.revisions.map(({ id, status, updatedAt }) => ({ id, status, updatedAt }))
-          const hold = db.hold
-          db.hold = null
-          await hold
-          return listed
+    // chapter-facts 现在一次聚合 IPC 返回一批稿的 facts；夹具按同一套判定逻辑从假库里现算。
+    invokeWithProjectSession: async (_session: unknown, channel: string, ids: unknown) => {
+      if (channel !== 'db:chapter-facts-overview') throw new Error(`unexpected IPC ${channel}`)
+      const hold = db.hold
+      db.hold = null
+      await hold
+      const requested = Array.isArray(ids) ? ids : [ids]
+      return requested.map(draftId => {
+        const revisions = db.revisions.map(({ id, status, updatedAt, sourceContent }) => ({ id, status, updatedAt, sourceContent }))
+        const pending = revisions.filter(revision => revision.status === 'pending')
+        const current = pending.filter(revision => revision.sourceContent !== null && revision.sourceContent === db.draft.content)
+        const latest = [...db.reviews].sort((a, b) => a.reviewIndex - b.reviewIndex).at(-1) ?? null
+        return {
+          draftId,
+          facts: {
+            mergeable: current.map(revision => revision.id),
+            stale: pending.flatMap(revision => current.includes(revision)
+              ? []
+              : [{ id: revision.id, reason: revision.sourceContent === null ? 'unsourced' as const : 'edited' as const }]),
+            latestReview: latest ? { createdAt: latest.createdAt, cycleStatus: latest.cycle } : null,
+            lastMergedAt: revisions.filter(revision => revision.status === 'merged').map(revision => revision.updatedAt).sort().at(-1) ?? null,
+          },
         }
-        case 'db:review-list': return db.reviews.map(({ id, reviewIndex, createdAt }) => ({ id, reviewIndex, createdAt }))
-        case 'db:review-get-full': return { id, content: '{"summary":"","items":[]}' }
-        case 'db:review-cycle-get': {
-          const cycle = db.reviews.find(review => review.id === id)?.cycle
-          return cycle ? { revisionStatus: cycle } : null
-        }
-        case 'db:draft-get-full': return db.draft
-        case 'db:revision-get-full': {
-          const revision = db.revisions.find(candidate => candidate.id === id)!
-          return { id, sourceDraft: revision.sourceContent === null ? null : { ...db.draft, content: revision.sourceContent } }
-        }
-        default: throw new Error(`unexpected IPC ${channel}`)
-      }
+      })
     },
   },
 }))

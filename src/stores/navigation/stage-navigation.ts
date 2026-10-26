@@ -121,6 +121,14 @@ function openKnowledge(): void {
   useEditorStore.getState().openFile({ id: 'knowledge-base', name: text('知识库', 'Knowledge base'), type: 'knowledge', projectKey })
 }
 
+/** 全文审稿中心是单例标签：再点一次只是聚焦已有标签，不重复开。 */
+function openReviewCenter(): void {
+  const projectKey = useProjectStore.getState().currentProject?.path
+  if (!projectKey) return
+  const text = useLocaleStore.getState().text
+  useEditorStore.getState().openFile({ id: 'review-center', name: text('全文审稿', 'Full review'), type: 'review-center', projectKey })
+}
+
 /** 正文阶段本身没有页面，落到当前该写的那一章；还没有任何章时先去蓝图。 */
 async function openManuscript(): Promise<void> {
   const session = currentSession()
@@ -183,6 +191,7 @@ function arrive(intent: Exclude<NavigationIntent, { kind: 'settings' }>): void {
       return
     case 'resource':
       if (intent.page === 'knowledge') openKnowledge()
+      else if (intent.page === 'review-center') openReviewCenter()
       else openPageTab(intent.page)
       return
     case 'run':

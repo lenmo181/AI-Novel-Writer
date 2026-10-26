@@ -294,7 +294,7 @@ describe('书房', () => {
 
     const session = { projectId: 'lighthouse', leaseId: 'lease-1', projectPath: LIGHTHOUSE.path }
     await act(async () => {
-      useStageStore.setState({ work: { session, architecture: { premise: true, characters: true }, blueprints: [] }, spineFacts: session })
+      useStageStore.setState({ work: { session, architecture: { premise: true, characters: true }, blueprints: [], review: { reviewed: 0, total: 0, openIssues: 0 } }, spineFacts: session })
       useDraftStore.setState({ draftsByChapter: {}, dataProjectSession: session, loading: false })
     })
     expect(primary()).toEqual(['继续写作 · 架构'])
@@ -317,13 +317,13 @@ describe('书房', () => {
     const primary = () => [...host!.querySelectorAll('.pi-btn--primary')].map(element => element.textContent)
 
     await act(async () => {
-      useStageStore.setState({ work: { session, architecture, blueprints: [1, 2, 3].map(chapterNumber => ({ chapterNumber, title: `第${chapterNumber}章` })) }, spineFacts: session })
+      useStageStore.setState({ work: { session, architecture, blueprints: [1, 2, 3].map(chapterNumber => ({ chapterNumber, title: `第${chapterNumber}章` })), review: { reviewed: 0, total: 0, openIssues: 0 } }, spineFacts: session })
       useDraftStore.setState({ draftsByChapter: { 1: draft(1, 1800), 2: draft(2, 2400), 3: draft(3, 0) } as never, dataProjectSession: session, loading: false })
     })
     expect(primary()).toEqual(['继续写作 · 第 2 章 · 待审稿'])
 
     await act(async () => {
-      useStageStore.setState({ work: { session, architecture, blueprints: [] } })
+      useStageStore.setState({ work: { session, architecture, blueprints: [], review: { reviewed: 0, total: 0, openIssues: 0 } } })
       useDraftStore.setState({ draftsByChapter: { 1: draft(1, 0) } as never })
     })
     expect(primary()).toEqual(['继续写作 · 架构'])

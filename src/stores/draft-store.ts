@@ -26,6 +26,8 @@ import { useEditorStore } from './editor-store'
 import { useLocaleStore } from './locale-store'
 
 let loadAllDraftsRequestSequence = 0
+/** 同一项目的全量草稿读取在途时，后来的调用直接搭车：打开作品期间 project-store 与流程脊各触发一次，不再重复跑同一条 IPC。 */
+const loadAllDraftsInFlight = new Map<string, Promise<void>>()
 
 function currentDraftProjectSession(
   expectedProjectPath?: string,
@@ -127,7 +129,74 @@ interface DraftState {
     error?: string; postCommitError?: string }>
 }
 
-export const useDraftStore = create<DraftState>()((set, get) => ({
+export const useDraftStore = create<DraftState>()((set, get) => {
+  /** loadAllDrafts 的实体：一次全量读取并写入 store；同项目的并发调用由 loadAllDraftsInFlight 合并。 */
+  async function loadAllDraftsOnce(
+    projectPath: string,
+    projectSession: ProjectSessionContext,
+  ): Promise<void> {
+    const requestId = ++loadAllDraftsRequestSequence
+    set(s => ({
+      draftsByChapter: sameProjectSessionContext(s.dataProjectSession, projectSession)
+        ? s.draftsByChapter
+        : {},
+      loading: true,
+      dataProjectKey: sameProjectSessionContext(s.dataProjectSession, projectSession)
+        ? projectPath
+        : null,
+      dataProjectSession: sameProjectSessionContext(s.dataProjectSession, projectSession)
+        ? projectSession
+        : null,
+      loadingProjectKey: projectPath,
+      loadingProjectSession: projectSession,
+    }))
+    try {
+      const drafts = await ipc.invokeWithProjectSession(projectSession, 'db:draft-list-all', projectPath)
+      const newDraftsByChapter: DraftsByChapter = {}
+
+      for (const draft of drafts) {
+        const chapterDrafts = newDraftsByChapter[draft.chapterNumber] ?? []
+        chapterDrafts.push({
+          ...draft,
+          status: draft.status as DraftStatus,
+          source: draft.source as DraftMeta['source'],
+          fileName: `draft_v${draft.version}.md`,
+          filePath: formatResourceUri({ kind: 'draft', id: draft.id })
+        })
+        newDraftsByChapter[draft.chapterNumber] = chapterDrafts
+      }
+
+      for (const chapterDrafts of Object.values(newDraftsByChapter)) {
+        chapterDrafts.sort((a, b) => b.version - a.version)
+      }
+
+      if (
+        requestId === loadAllDraftsRequestSequence
+        && sameProjectSessionContext(
+          projectSession,
+          projectSessionContextFromProject(useProjectStore.getState().currentProject),
+        )
+      ) {
+        set({
+          draftsByChapter: newDraftsByChapter,
+          dataProjectKey: projectPath,
+          dataProjectSession: projectSession,
+        })
+      }
+    } finally {
+      if (
+        requestId === loadAllDraftsRequestSequence
+        && sameProjectSessionContext(
+          projectSession,
+          projectSessionContextFromProject(useProjectStore.getState().currentProject),
+        )
+      ) {
+        set({ loading: false, loadingProjectKey: null, loadingProjectSession: null })
+      }
+    }
+  }
+
+  return {
   draftsByChapter: {},
   loading: false,
   dataProjectKey: null,
@@ -196,68 +265,16 @@ export const useDraftStore = create<DraftState>()((set, get) => ({
     const projectSession = currentDraftProjectSession(expectedProjectPath, expectedProjectSession)
     if (!project || !projectSession) return
     const projectPath = expectedProjectPath ?? project.path
-    const requestId = ++loadAllDraftsRequestSequence
-
-    set(s => ({
-      draftsByChapter: sameProjectSessionContext(s.dataProjectSession, projectSession)
-        ? s.draftsByChapter
-        : {},
-      loading: true,
-      dataProjectKey: sameProjectSessionContext(s.dataProjectSession, projectSession)
-        ? projectPath
-        : null,
-      dataProjectSession: sameProjectSessionContext(s.dataProjectSession, projectSession)
-        ? projectSession
-        : null,
-      loadingProjectKey: projectPath,
-      loadingProjectSession: projectSession,
-    }))
+    const inFlight = loadAllDraftsInFlight.get(projectPath)
+    if (inFlight) return inFlight
+    const execution = loadAllDraftsOnce(projectPath, projectSession)
+    loadAllDraftsInFlight.set(projectPath, execution)
     try {
-      const drafts = await ipc.invokeWithProjectSession(projectSession, 'db:draft-list-all', projectPath)
-      const newDraftsByChapter: DraftsByChapter = {}
-
-      for (const draft of drafts) {
-        const chapterDrafts = newDraftsByChapter[draft.chapterNumber] ?? []
-        chapterDrafts.push({
-          ...draft,
-          status: draft.status as DraftStatus,
-          source: draft.source as DraftMeta['source'],
-          fileName: `draft_v${draft.version}.md`,
-          filePath: formatResourceUri({ kind: 'draft', id: draft.id })
-        })
-        newDraftsByChapter[draft.chapterNumber] = chapterDrafts
-      }
-
-      for (const chapterDrafts of Object.values(newDraftsByChapter)) {
-        chapterDrafts.sort((a, b) => b.version - a.version)
-      }
-
-      if (
-        requestId === loadAllDraftsRequestSequence
-        && sameProjectSessionContext(
-          projectSession,
-          projectSessionContextFromProject(useProjectStore.getState().currentProject),
-        )
-      ) {
-        set({
-          draftsByChapter: newDraftsByChapter,
-          dataProjectKey: projectPath,
-          dataProjectSession: projectSession,
-        })
-      }
+      await execution
     } finally {
-      if (
-        requestId === loadAllDraftsRequestSequence
-        && sameProjectSessionContext(
-          projectSession,
-          projectSessionContextFromProject(useProjectStore.getState().currentProject),
-        )
-      ) {
-        set({ loading: false, loadingProjectKey: null, loadingProjectSession: null })
-      }
+      if (loadAllDraftsInFlight.get(projectPath) === execution) loadAllDraftsInFlight.delete(projectPath)
     }
   },
-
 
   markDraftStatus: async (draftPath, chapterNumber, status, expectedProjectSession) => {
     const project = useProjectStore.getState().currentProject
@@ -394,7 +411,8 @@ export const useDraftStore = create<DraftState>()((set, get) => ({
       return { success: false, error: e instanceof Error ? e.message : String(e) }
     }
   },
-}))
+  }
+})
 
 // ===== 辅助工具导出 =====
 

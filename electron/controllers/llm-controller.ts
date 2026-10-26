@@ -65,12 +65,12 @@ function saveModelConfigs(models: ModelProfile[]) {
   writeJsonFile(MODELS_CONFIG_PATH, models)
 }
 
-function getModelConfig(modelId: string): ModelProfile | null {
+export function getModelConfig(modelId: string): ModelProfile | null {
   const models = loadModelConfigs()
   return models.find((m) => m.id === modelId) ?? null
 }
 
-function applyProxyConfig() {
+export function applyProxyConfig() {
   try {
     const config = readJsonFile<GlobalConfig>(GLOBAL_CONFIG_PATH, DEFAULT_GLOBAL_CONFIG)
     if (config.proxy?.enabled && config.proxy.host) {

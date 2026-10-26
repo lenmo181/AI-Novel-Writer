@@ -278,6 +278,36 @@ function rowsToMeta(db: BetterSqlite3.Database, rows: Record<string, unknown>[])
     return parsed.map(({ row, dependencies, valid }) => rowToMeta(row, dependencies, valid, states, memo))
 }
 
+/**
+ * listAll 专用的轻量投影：跳过 dependencyStates（它会把依赖稿的 contents.body 全文读进内存并逐条 sha256，
+ * 大部头项目下等于整表正文扫描）。listAll 的消费方只用章号、标题、状态与字数；
+ * 需要真实 dependenciesStale 的版本历史走 listByChapter/getMeta，那里仍然是全量计算。
+ */
+function rowsToMetaLite(rows: Record<string, unknown>[]): DraftMeta[] {
+    return rows.map(row => rowToMetaLiteRow(row))
+}
+
+function rowToMetaLiteRow(row: Record<string, unknown>): DraftMeta {
+    const chapterTitle = typeof row.chapter_title === 'string' && row.chapter_title.trim()
+        ? row.chapter_title
+        : undefined
+    const parsed = parseDependencies(row.source_dependencies)
+    return {
+        id: row.id as number,
+        chapterNumber: row.chapter_number as number,
+        ...(chapterTitle ? { chapterTitle } : {}),
+        version: row.version as number,
+        status: row.status as string,
+        source: row.source as string,
+        contentId: row.content_id as number,
+        wordCount: row.word_count as number,
+        sourceDependencies: parsed.dependencies,
+        dependenciesStale: false,
+        createdAt: row.created_at as string,
+        updatedAt: row.updated_at as string,
+    }
+}
+
 /** DB 行 → DraftMeta */
 function rowToMeta(
     row: Record<string, unknown>,
@@ -372,7 +402,10 @@ export class DraftRepository {
         return rowsToMeta(db, rows)
     }
 
-    /** 列出全部章节的草稿元数据（按章节、版本升序） */
+    /**
+     * 列出全部章节的草稿元数据（按章节、版本升序）。
+     * 轻量投影：不做依赖稿正文哈希（见 rowsToMetaLite）。
+     */
     static listAll(): DraftMeta[] {
         const db = getProjectDb()
         if (!db) return []
@@ -382,7 +415,7 @@ export class DraftRepository {
       ORDER BY drafts.chapter_number ASC, drafts.version ASC
     `).all() as Record<string, unknown>[]
 
-        return rowsToMeta(db, rows)
+        return rowsToMetaLite(rows)
     }
 
     /** 获取草稿元数据 */

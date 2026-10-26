@@ -122,6 +122,8 @@ function ProjectBackupPanelSession({
       if (active) setCmCloudLoading(false)
     })
     return () => { active = false }
+    // 与上面的状态加载一致：按冻结的会话边界取数，projectSession 就是这次请求的凭据。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionKey])
 
   const run = async (action: () => Promise<void>) => {

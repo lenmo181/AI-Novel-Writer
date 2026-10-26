@@ -460,7 +460,7 @@ export abstract class BaseWorkflowCommand<TResult = string> {
     context?: WorkflowContext,
   ): Promise<LLMCompletion> {
     let retries = 0
-    while (true) {
+    for (;;) {
       try {
         const completion = await this.callLLMResult(prompt, systemPrompt, callbacks, options, context)
         if (!transientCompletionFailure(completion) || retries >= MAX_TRANSIENT_GENERATION_RETRIES) {

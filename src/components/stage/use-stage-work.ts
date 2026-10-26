@@ -12,7 +12,7 @@ import {
   type ChapterRow, type StageLocation, type StageStatus,
 } from '../../stores/navigation/stage-progress'
 import { refreshChapterFacts } from '../../stores/navigation/chapter-facts'
-import { useStageStore } from '../../stores/navigation/stage-store'
+import { useStageStore , type StageWork } from '../../stores/navigation/stage-store'
 import { navigate, type WorkStage } from '../../stores/navigation/navigation-intents'
 import { useProjectStore } from '../../stores/project-store'
 import { useWorkflowStore, type WorkflowRun } from '../../stores/workflow-store'
@@ -37,18 +37,30 @@ export async function refreshStageWork(text: (zh: string, en: string) => string)
   const current = () => request === refreshSequence && isProjectSessionCurrent(session)
     && useProjectStore.getState().projectSessionEpoch === projectSessionEpoch
   try {
-    const [architecture, blueprints] = await Promise.all([
+    const [architecture, blueprints, , reviewOverview] = await Promise.all([
       checkArchConfirmed(session, currentProject?.novelConfig),
       ipc.invokeWithProjectSession(session, 'db:blueprint-get-all', session.projectPath),
       useDraftStore.getState().loadAllDrafts(session.projectPath, session),
+      // 审校这一步的进度：一次聚合 IPC 已在主进程算好，直接取结果。
+      ipc.invokeWithProjectSession(session, 'db:review-overview', session.projectPath)
+        .then(result => result.success && result.chapters ? result.chapters : [])
+        .catch(() => []),
     ])
     if (!current()) return
     const chapters = blueprints.map(({ chapterNumber, title }) => ({ chapterNumber, title }))
+    const plannedChapters = currentProject?.novelConfig.totalChapters ?? 0
+    const reviewTotal = plannedChapters > 0 ? plannedChapters : chapters.length
+    const review = {
+      reviewed: reviewOverview.length,
+      total: reviewTotal,
+      openIssues: reviewOverview.reduce((total, chapter) => total
+        + chapter.counts.critical + chapter.counts.suggest + chapter.counts.verify, 0),
+    }
     const working = deriveChapters({ blueprints: chapters, drafts: useDraftStore.getState().draftsByChapter, runningChapters: new Set() })
       .flatMap(row => row.draft && row.draft.status !== 'finalized' ? [row.draft] : [])
     // 落点只看章是否待写或定稿，不需要 facts，所以先出 work；流程脊等 spineFacts。主进程按到达顺序处理读取：
     // 等一个任务，让落点先把那一章的正文读取发出去，facts 排在它后面。
-    useStageStore.setState({ work: { session, architecture, blueprints: chapters } })
+    useStageStore.setState({ work: { session, architecture, blueprints: chapters, review } })
     await new Promise(resolve => setTimeout(resolve, 0))
     if (!current()) return
     await refreshChapterFacts(working, session)
@@ -116,6 +128,8 @@ export interface StageView {
   location: StageLocation | null
   /** 打开作品时该落到的阶段：架构、蓝图与草稿都已按当前项目会话载入、且草稿不在重新载入中才有，不等各稿的审稿与修稿记录。 */
   landing: WorkStage | null
+  /** 全文审校进度（流程脊第五步）；数据没读到时为 undefined。 */
+  review?: StageWork['review']
 }
 
 /** 这部作品正在生成的章号，排好序拼成字符串：运行进度每跳一次，只要涉及的章没变，键就不变。 */
@@ -167,6 +181,7 @@ export function useStageView(): StageView {
     chapters: shown ? chapters : NO_CHAPTERS,
     location,
     landing: settled ? landingStage(stages) : null,
+    review: shown ? currentWork?.review : undefined,
   }
 }
 

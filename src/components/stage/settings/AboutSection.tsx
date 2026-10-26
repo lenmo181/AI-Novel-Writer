@@ -1,5 +1,6 @@
 import { APP_BRAND } from '../../../shared/brand'
 import { useLocaleStore } from '../../../stores/locale-store'
+import ChangelogList from './ChangelogList'
 import { UpdateSettings } from '../StageUpdate'
 
 /** 关于与更新：应用名、版本、定位说明，以及检查更新与更新状态。 */
@@ -20,6 +21,7 @@ export default function AboutSection() {
         'A local writing tool for long-form fiction. Your books, settings and drafts stay on your computer, and every step from setup to manuscript can be assisted by the models you choose.',
       )}</p>
       <UpdateSettings />
+      <ChangelogList />
     </div>
   )
 }

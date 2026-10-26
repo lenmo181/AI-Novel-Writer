@@ -17,7 +17,7 @@ import type {
   ReadyProjectOverview,
 } from '../../src/shared/project-overview'
 import { CURRENT_DESKTOP_SCHEMA_VERSION, getDesktopMigrationRegistry } from '../migrations/desktop-registry'
-import { verifySchema } from '../migrations/runner'
+import { verifySchemaShallow } from '../migrations/runner'
 import { CURRENT_DRAFT_STATUS_SQL } from '../../src/shared/draft-status'
 import { SqliteSchemaAdapter } from '../migrations/sqlite-schema-adapter'
 
@@ -127,6 +127,23 @@ function sameSnapshotContent(left: readonly PhysicalFileState[], right: readonly
   })
 }
 
+const FACTS_CHUNK = 400
+
+function placeholdersFor(count: number): string {
+  return Array.from({ length: count }, () => '?').join(', ')
+}
+
+function chunkedDraftIds<T>(ids: readonly number[], query: (chunk: readonly number[]) => T[]): T[] {
+  const result: T[] = []
+  for (let offset = 0; offset < ids.length;) {
+    const chunk = ids.slice(offset, offset + FACTS_CHUNK)
+    offset += chunk.length
+    if (chunk.length === 0) continue
+    result.push(...query(chunk))
+  }
+  return result
+}
+
 function positiveChapter(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) > 0
 }
@@ -171,18 +188,24 @@ interface FinalizedRow {
   draftId: number
   chapterNumber: number
   version: number
-  body: string
   finalizationId: string | null
   outboxChapterNumber: number | null
   contentHash: string | null
-  contentSnapshot: string | null
 }
+
+/**
+ * 定稿收据的核验缓存：定稿稿与其收据不可变，正文全文比对 + sha256 每稿只做一次。
+ * 键带收据哈希：极端情况下同一位置被不同内容重写时自然失效。回书房原来每次都全表读正文哈希，
+ * 大部头项目下这是打开链路之外最重的一条路。
+ */
+const finalizedReceiptCache = new Map<string, boolean>()
 
 function aggregateProject(
   database: BetterSqlite3.Database,
   projectId: string,
   includeExcerpt: boolean,
   physicalRevision = '',
+  cacheScope = '',
 ): ReadyProjectOverview {
   const core = database.prepare(`
     SELECT project_name AS projectName, genre, sub_genre AS subGenre,
@@ -220,12 +243,10 @@ function aggregateProject(
   `).all() as { chapterNumber: number }[])
   const finalizedRows = database.prepare(`
     SELECT drafts.id AS draftId, drafts.chapter_number AS chapterNumber, drafts.version,
-           contents.body, finalization_outbox.finalization_id AS finalizationId,
+           finalization_outbox.finalization_id AS finalizationId,
            finalization_outbox.chapter_number AS outboxChapterNumber,
-           finalization_outbox.content_hash AS contentHash,
-           finalization_outbox.content_snapshot AS contentSnapshot
+           finalization_outbox.content_hash AS contentHash
     FROM drafts
-    JOIN contents ON contents.id=drafts.content_id
     LEFT JOIN finalization_outbox ON finalization_outbox.draft_id=drafts.id
     WHERE drafts.status='finalized'
       AND NOT EXISTS (
@@ -235,12 +256,33 @@ function aggregateProject(
       )
     ORDER BY drafts.chapter_number, drafts.version DESC, drafts.id DESC
   `).all() as FinalizedRow[]
+  // 首见的定稿才读正文核验收据；核验过的（无论通过与否）按 收据哈希 记住结果。
+  const unverifiable = finalizedRows.filter(row => positiveChapter(row.draftId) && positiveChapter(row.chapterNumber)
+    && positiveChapter(row.version)
+    && row.finalizationId !== null && Boolean(row.finalizationId.trim())
+    && row.outboxChapterNumber === row.chapterNumber
+    && !finalizedReceiptCache.has(`${cacheScope}#${row.draftId}:${row.version}:${row.contentHash ?? ''}`))
+  const verificationBodies = unverifiable.length === 0
+    ? []
+    : chunkedDraftIds(unverifiable.map(row => row.draftId), chunk => database.prepare(`
+        SELECT drafts.id AS draftId, contents.body AS body, finalization_outbox.content_snapshot AS contentSnapshot
+        FROM drafts
+        JOIN contents ON contents.id=drafts.content_id
+        LEFT JOIN finalization_outbox ON finalization_outbox.draft_id=drafts.id
+        WHERE drafts.id IN (${placeholdersFor(chunk.length)})
+      `).all(...chunk) as unknown as Array<{ draftId: number; body: string; contentSnapshot: string | null }>)
+  for (const row of verificationBodies) {
+    const meta = unverifiable.find(item => item.draftId === row.draftId)
+    if (!meta) continue
+    const valid = typeof row.body === 'string' && Boolean(row.body.trim())
+      && row.contentSnapshot === row.body && meta.contentHash === digest(row.body)
+    finalizedReceiptCache.set(`${cacheScope}#${meta.draftId}:${meta.version}:${meta.contentHash ?? ''}`, valid)
+  }
   const finalized = finalizedRows.filter(row => {
     if (!positiveChapter(row.draftId) || !positiveChapter(row.chapterNumber) || !positiveChapter(row.version)
-      || typeof row.body !== 'string' || !row.body.trim()) return false
-    return row.finalizationId !== null && Boolean(row.finalizationId.trim())
-      && row.outboxChapterNumber === row.chapterNumber
-      && row.contentSnapshot === row.body && row.contentHash === digest(row.body)
+      || row.finalizationId === null || row.finalizationId.trim() === ''
+      || row.outboxChapterNumber !== row.chapterNumber) return false
+    return finalizedReceiptCache.get(`${cacheScope}#${row.draftId}:${row.version}:${row.contentHash ?? ''}`) === true
   })
   const finalizedChapters = chapterNumbers(finalized)
   const totalWords = currentDrafts.reduce((total, row) => total
@@ -364,8 +406,8 @@ export class ProjectPeekService {
   readCurrent(projectId: string, database: BetterSqlite3.Database): ProjectOverview {
     try {
       if (!projectId) return UNAVAILABLE
-      verifySchema(new SqliteSchemaAdapter(database), getDesktopMigrationRegistry(), CURRENT_DESKTOP_SCHEMA_VERSION)
-      return aggregateProject(database, projectId, true)
+      verifySchemaShallow(new SqliteSchemaAdapter(database), getDesktopMigrationRegistry(), CURRENT_DESKTOP_SCHEMA_VERSION)
+      return aggregateProject(database, projectId, true, '', database.name)
     } catch {
       return UNAVAILABLE
     }
@@ -398,12 +440,12 @@ export class ProjectPeekService {
       }
       database = new Database(snapshotPath, { readonly: true, fileMustExist: true })
       database.pragma('foreign_keys = ON')
-      verifySchema(new SqliteSchemaAdapter(database), getDesktopMigrationRegistry(), capability.expectedSchemaVersion)
+      verifySchemaShallow(new SqliteSchemaAdapter(database), getDesktopMigrationRegistry(), capability.expectedSchemaVersion)
       const physicalRevision = digest(JSON.stringify({
         manifest: capability.manifestFingerprint,
         files: before.map(file => [file.suffix, file.size, file.hash]),
       }))
-      return aggregateProject(database, capability.projectId, false, physicalRevision)
+      return aggregateProject(database, capability.projectId, false, physicalRevision, capability.rootPath)
     } finally {
       database?.close()
       fs.rmSync(attempt, { recursive: true, force: true })

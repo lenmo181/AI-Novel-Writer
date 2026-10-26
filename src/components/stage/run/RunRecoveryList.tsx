@@ -1,4 +1,5 @@
-import { useId, useRef, useState, type ReactNode } from 'react'
+import { useId, useMemo, useRef, useState, type ReactNode } from 'react'
+import { ChevronRight } from 'lucide-react'
 import { countDraftUnits } from '../../../shared/draft-units'
 import { useLocaleStore } from '../../../stores/locale-store'
 import GenerationBudgetDiagnostics from '../../panels/GenerationBudgetDiagnostics'
@@ -17,13 +18,37 @@ type Text = (zh: string, en: string) => string
 export function RunRecoveryList({ recovery, liveRuns }: { recovery: RunRecovery; liveRuns: readonly WorkflowRun[] }) {
   const text = useLocaleStore(s => s.text)
   const leaseId = useProjectStore(s => s.currentProject?.sessionLease)
+  const projectKey = useProjectStore(s => s.currentProject?.path)
   const entries = recovery.entries.filter(entry => !isInFlight(entry, leaseId, liveRuns))
   const errors = [recovery.generationError, recovery.candidateError].filter(Boolean)
+  // 默认收起：可恢复的备选内容堆多了会把运行侧页顶得很长。展开与否按作品记住（存 localStorage，渲染期读取）。
+  const collapsedKey = `pagekin:recovery-collapsed:${projectKey ?? 'none'}`
+  const storedExpanded = useMemo(() => {
+    try { return localStorage.getItem(collapsedKey) === '1' } catch { return false }
+  }, [collapsedKey])
+  const [override, setOverride] = useState<{ key: string; value: boolean } | null>(null)
+  const expanded = override?.key === collapsedKey ? override.value : storedExpanded
+  const toggle = () => {
+    const next = !expanded
+    try { localStorage.setItem(collapsedKey, next ? '1' : '0') } catch { /* 会话不可写时只在本次生效 */ }
+    setOverride({ key: collapsedKey, value: next })
+  }
   if (!entries.length && !errors.length) return null
   return (
     <section className="run-recovery" aria-label={text('可恢复的内容', 'Recoverable work')}>
       {errors.map(error => <p key={error} className="run-note" data-tone="danger" role="alert">{error}</p>)}
-      {entries.map(entry => <RecoveryCard key={`${entry.kind}:${entry.key}`} entry={entry} recovery={recovery} text={text} />)}
+      {entries.length > 0 && (
+        <button type="button" className="run-recovery-toggle" aria-expanded={expanded} onClick={toggle}>
+          <ChevronRight className="run-recovery-chevron" size={14} aria-hidden="true" />
+          <span>{text(`可恢复的内容 · ${entries.length} 项`, `Recoverable work · ${entries.length}`)}</span>
+          <span className="run-recovery-hint">
+            {expanded
+              ? text('收起', 'Collapse')
+              : text('生成的备选内容都在这里，点开查看或继续', 'Generated alternatives live here; expand to view or continue')}
+          </span>
+        </button>
+      )}
+      {(expanded || entries.length === 0) && entries.map(entry => <RecoveryCard key={`${entry.kind}:${entry.key}`} entry={entry} recovery={recovery} text={text} />)}
     </section>
   )
 }

@@ -8,12 +8,21 @@ export interface SchemaProbe {
   readonly fingerprint: string
 }
 
+export interface SchemaProbeOptions {
+  /**
+   * 是否做全库完整性扫描（integrity_check + foreign_key_check，O(库文件大小)）。
+   * 默认 true：迁移路径必须深校验。例行打开项目/读取概览时传 false——
+   * 指纹与版本校验已足以发现被篡改或不认识的库，全库扫描交给迁移与备份，不该出现在每次点击打开的路上。
+   */
+  readonly integrity?: boolean
+}
+
 /** Read-only probe. A familiar version number alone never authorizes writes. */
-export function probeSchema(db: SchemaReader, registry: MigrationRegistry): SchemaProbe {
+export function probeSchema(db: SchemaReader, registry: MigrationRegistry, options: SchemaProbeOptions = {}): SchemaProbe {
   const version = db.readUserVersion()
   if (!Number.isInteger(version) || version < 0) throw new SchemaMigrationError('INVALID_SCHEMA_VERSION')
   if (version > LATEST_SCHEMA_VERSION) throw new SchemaMigrationError('NEWER_SCHEMA_READ_ONLY')
-  if (!db.integrityCheck() || !db.foreignKeyCheck()) throw new SchemaMigrationError('CORRUPT_SCHEMA')
+  if (options.integrity !== false && (!db.integrityCheck() || !db.foreignKeyCheck())) throw new SchemaMigrationError('CORRUPT_SCHEMA')
   const fingerprint = db.readSchemaFingerprint()
   if (!registry.recognizedSchemas.some(item => item.version === version && item.fingerprint === fingerprint)) {
     throw new SchemaMigrationError('UNRECOGNIZED_SCHEMA')
@@ -24,6 +33,21 @@ export function probeSchema(db: SchemaReader, registry: MigrationRegistry): Sche
 /** Separate read-only verification; does not acquire a session or reopen repositories. */
 export function verifySchema(db: SchemaReader, registry: MigrationRegistry, target: number): SchemaProbe {
   const probe = probeSchema(db, registry)
+  if (probe.version !== target) throw new SchemaMigrationError('SCHEMA_VERSION_MISMATCH')
+  if (target > 0) {
+    const implementation = registry.implementations.find(step => step.to === target)
+    if (!implementation) throw new SchemaMigrationError('MIGRATION_NOT_INSTALLED')
+    if (!implementation.verify(db)) throw new SchemaMigrationError('MIGRATION_VERIFICATION_FAILED')
+  }
+  return probe
+}
+
+/**
+ * 例行打开用的浅校验：与 verifySchema 相同的版本、指纹与实现校验，
+ * 只省掉 O(库文件大小) 的全库完整性扫描。深度校验保留给 migrateSchema 与备份路径。
+ */
+export function verifySchemaShallow(db: SchemaReader, registry: MigrationRegistry, target: number): SchemaProbe {
+  const probe = probeSchema(db, registry, { integrity: false })
   if (probe.version !== target) throw new SchemaMigrationError('SCHEMA_VERSION_MISMATCH')
   if (target > 0) {
     const implementation = registry.implementations.find(step => step.to === target)

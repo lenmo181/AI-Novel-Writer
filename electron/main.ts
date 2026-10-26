@@ -15,6 +15,7 @@ import {
   isWindowsUpdateRuntimeEnabled,
 } from './services/update-runtime'
 import { startUpdateRuntime } from './services/update-startup'
+import { changelogLocations, createChangelogReader } from './services/changelog-reader'
 import {
   claimReleaseVectorSmokeInvocation,
   releaseVectorSmokeWasRequested,
@@ -36,7 +37,7 @@ import { installWindowCloseGuard } from './controllers/window-controller'
 import { registerStartupController } from './controllers/startup-controller'
 import { resolveDefaultUserData, resolveGlobalDataRoots } from './services/app-data-locator'
 import { runGlobalDataMigration, activateGlobalData } from './services/global-data-migration'
-import { ensureVelaHome } from './utils/config-utils'
+import { ensureVelaHome, GLOBAL_CONFIG_PATH, tryReadJsonFile } from './utils/config-utils'
 import type { StartupBlockedCode, StartupMigrationNotice } from '../src/shared/startup-contract'
 import { APP_BRAND } from '../src/shared/brand'
 
@@ -132,6 +133,16 @@ function publishUpdateState(state: UpdateState): void {
   }
 }
 
+/** 读取渲染进程镜像进 config.json 的主题；读不到或值非法时按外观默认的浅色。 */
+function storedColorTheme(): 'light' | 'dark' {
+  try {
+    const result = tryReadJsonFile<{ colorTheme?: string }>(GLOBAL_CONFIG_PATH)
+    return result.status === 'ok' && result.value?.colorTheme === 'dark' ? 'dark' : 'light'
+  } catch {
+    return 'light'
+  }
+}
+
 function createWindow() {
   win = new BrowserWindow({
     width: 1440,
@@ -142,7 +153,9 @@ function createWindow() {
     icon: path.join(process.env.APP_ROOT!, 'build', 'icon.png'),
     // 使用应用内自绘标题栏，避免 Windows 原生标题栏与棕色标题栏重复显示。
     frame: Boolean(startupBlockedCode),
-    backgroundColor: '#1e1e1e',
+    // 窗口底色跟随后动主题：渲染进程每次换主题都会把 colorTheme 镜像进 config.json，
+    // 首帧不再按恒定深色闪一下。缺省按外观默认的浅色。
+    backgroundColor: storedColorTheme() === 'dark' ? '#0B0D12' : '#EAE8E2',
     webPreferences: {
       preload: path.join(__dirname, 'preload.mjs'),
       // 安全性设置
@@ -280,7 +293,11 @@ app.whenReady().then(async () => {
       : createGitHubReleaseUpdateBackend,
     createPreferences: () => new GlobalConfigUpdatePreferencesStore(),
     registerController: updateService => {
-      registerUpdateController(updateService, { ipc: ipcMain, publish: publishUpdateState })
+      registerUpdateController(updateService, {
+        ipc: ipcMain,
+        publish: publishUpdateState,
+        readChangelog: createChangelogReader(changelogLocations(app.isPackaged, process.env.APP_ROOT ?? path.dirname(__dirname), process.resourcesPath)),
+      })
     },
     reportFailure: (operation, error) => {
       console.warn(`[AI Novel Update] ${operation}失败，已降级并继续启动应用。`, error)

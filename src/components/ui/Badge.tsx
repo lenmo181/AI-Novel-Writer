@@ -38,7 +38,7 @@ const badgeVariants = cva(
           'border border-[var(--color-border)] text-[var(--color-text-secondary)] bg-transparent',
         /** 纯色强调 — 白字品牌底（如"默认"标签） */
         solid:
-          'bg-[var(--color-accent)] text-white',
+          'bg-[var(--color-accent)] text-[var(--color-accent-ink)]',
       },
     },
     defaultVariants: {

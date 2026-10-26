@@ -330,9 +330,12 @@ Produce a complete outline made of structural turning points rather than chapter
 2. State the concrete event at every structural turn.
 3. Match the escalation and reveal cadence to {{genre}}.
 4. Respect the information limits and suspense opportunities of {{narrative_pov}}.
-5. Treat explicit author facts in the story premise, character dynamics, and world system as causal constraints. Never omit, weaken, or reverse them.
-6. Preserve the project-wide writing guidance.
-7. Return only the plot architecture, with no analysis or explanation.`,
+5. Treat explicit author facts in the story premise, character dynamics, and world system as causal constraints. Never omit, weaken, or reverse them — but respecting author facts does not freeze the story world: everything the author has not pinned down must grow with the plot.
+6. Characters must evolve: introduce new characters as the plot advances (allies, opponents, factions, passers-by), state their identity and role in the relevant chapter, and let existing relationships shift. Never let one small cast carry the whole book, and never let several consecutive chapters concentrate on the same group.
+7. The world must expand: when the story reaches new places, factions, or rules, write the new world-building directly into that chapter's outline, consistent with confirmed author facts.
+8. The main line must advance: every chapter contains a concrete change that moves the story forward (new information, new goal, new conflict, new cost). No treading water, no repeating plot patterns already written.
+9. Preserve the project-wide writing guidance.
+10. Return only the plot architecture, with no analysis or explanation.`,
     systemSuffix: `[Author guidance for this step — highest priority when present]
 {{step_guidance}}`,
   },
