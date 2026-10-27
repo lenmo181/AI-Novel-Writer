@@ -213,6 +213,8 @@ export interface GlobalConfig {
   theme: string
   /** 渲染进程外观主题的镜像：主进程只在创建窗口时读它定首帧底色。 */
   colorTheme?: 'light' | 'dark'
+  /** 硬件加速开关：默认开启；关闭后走软件渲染（ready 前读取，重启生效）。 */
+  hardwareAcceleration?: boolean
 
   outlineTargetUnits?: number
   blueprintTargetUnits?: number

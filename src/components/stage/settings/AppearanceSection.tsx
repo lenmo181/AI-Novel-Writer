@@ -4,6 +4,8 @@ import type { Locale } from '../../../i18n/types'
 import { useLocaleStore } from '../../../stores/locale-store'
 import { FONT_OPTIONS, useThemeStore, type FontId } from '../../../stores/theme-store'
 import { useAutoOpenNextChapter } from '../../settings/use-auto-open-next-chapter'
+import { useHardwareAcceleration } from '../../settings/use-hardware-acceleration'
+import { toast } from '../../ui/Toast'
 import { Button } from '../../ui/Button'
 import { Check } from '../../ui/Check'
 import { commandLabel } from '../shortcut-keys'
@@ -76,6 +78,7 @@ export default function AppearanceSection() {
   const setLocale = useLocaleStore(s => s.setLocale)
   const { zoom, zoomIn, zoomOut, zoomReset, uiFont, setUiFont, writingFont, setWritingFont } = useThemeStore()
   const autoOpenNext = useAutoOpenNextChapter()
+  const hardwareAcceleration = useHardwareAcceleration()
   const languageId = useId()
   const uiFontId = useId()
   const writingFontId = useId()
@@ -118,6 +121,17 @@ export default function AppearanceSection() {
           label={<span className="stage-visually-hidden">{text('定稿后打开下一章', 'Open the next chapter after finalizing')}</span>} />}
       >
         {autoOpenNext.error && <p className="stage-set-error" role="alert">{autoOpenNext.error}</p>}
+      </Row>
+      <Row
+        title={text('硬件加速', 'Hardware acceleration')}
+        desc={text('默认开启。如果整个应用都卡顿、拖动窗口不流畅，可尝试关闭改用软件渲染；更改在重启应用后生效。', 'On by default. If the whole app feels laggy or dragging stutters, turn this off to use software rendering. Applies after restart.')}
+        control={<Check kind="switch" checked={hardwareAcceleration.enabled} disabled={hardwareAcceleration.saving} onChange={checked => {
+          void hardwareAcceleration.set(checked)
+          if (hardwareAcceleration.error === null) toast.info(text('更改将在重启应用后生效', 'The change applies after the app restarts'))
+        }}
+          label={<span className="stage-visually-hidden">{text('硬件加速', 'Hardware acceleration')}</span>} />}
+      >
+        {hardwareAcceleration.error && <p className="stage-set-error" role="alert">{hardwareAcceleration.error}</p>}
       </Row>
     </div>
   )

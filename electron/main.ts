@@ -81,6 +81,16 @@ if (explicitUserData) {
   app.setPath('userData', resolveDefaultUserData(app.getPath('appData')))
 }
 
+// 硬件加速开关必须在 app ready 之前决定。默认开启；用户在「设置 · 外观」里关闭后
+// 走软件渲染——当机器的 GPU 进程起不来或驱动异常导致整体卡顿时，软件渲染反而更稳更顺。
+try {
+  const accelerationConfig = tryReadJsonFile<{ hardwareAcceleration?: boolean }>(GLOBAL_CONFIG_PATH)
+  if (accelerationConfig.status === 'ok' && accelerationConfig.value?.hardwareAcceleration === false) {
+    app.disableHardwareAcceleration()
+    console.warn('[AI Novel Writer] 硬件加速已关闭（设置 · 外观），本次启动使用软件渲染。')
+  }
+} catch { /* 配置读不到时按默认开启处理 */ }
+
 // The installed-package vector qualification is deliberately opt-in and
 // fail-closed. A command-line request without the matching environment token
 // must never turn into a normal interactive application launch.
@@ -275,6 +285,13 @@ app.whenReady().then(async () => {
   registerMCPHandlers()
   startupHasSettled = true
   // 更新功能失败不能阻断作者进入应用；窗口先于更新运行时创建。
+  try {
+    const gpuStatus = app.getGPUFeatureStatus()
+    console.warn('[AI Novel Writer] GPU 状态:', JSON.stringify(gpuStatus))
+    if (gpuStatus.gpu_compositing === 'software' || gpuStatus.gpu_compositing === 'disabled') {
+      console.warn('[AI Novel Writer] 当前使用软件合成。若整体卡顿，可在「设置 · 外观」尝试切换硬件加速。')
+    }
+  } catch { /* GPU 状态仅用于诊断 */ }
   createWindow()
   const windowsUpdateEnabled = isWindowsUpdateRuntimeEnabled(app.isPackaged, VITE_DEV_SERVER_URL)
   const macUpdateReminderEnabled = isMacUpdateReminderEnabled(app.isPackaged, VITE_DEV_SERVER_URL)
