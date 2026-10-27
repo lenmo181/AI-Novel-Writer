@@ -126,7 +126,11 @@ function findCompleteJsonObjectEnd(source: string, start: number): number | unde
 
 /** Review generation skips whole arrays instead of selecting their inner objects; character defaults stay unchanged. */
 // i18n-exempt: 调用方 catch 后改走重建或给出按语言的说明，不显示这条原文
-export function extractSingleCompleteJsonObject(content: string, excludeArrayRoots = false): string {
+export function extractSingleCompleteJsonObject(
+  content: string,
+  excludeArrayRoots = false,
+  validate?: (value: Record<string, unknown>) => boolean,
+): string {
   const source = stripThinkingTags(content).trim()
   const candidates: string[] = []
   let searchFrom = 0
@@ -150,6 +154,18 @@ export function extractSingleCompleteJsonObject(content: string, excludeArrayRoo
     searchFrom = end + 1
   }
 
+  // 推理型模型常先输出一版草稿再输出修订版，或在正文后附示例对象——文本里出现多个
+  // 完整 JSON 是常态。提供 validate（按调用方的信封契约校验）时，取最后一个通过校验的
+  // 候选（模型的最终答案几乎总在最后）；一个都不过时若只有一个候选，原样交回让下游给出
+  // 精确的契约错误，多个则保留原本的歧义报错。
+  if (validate) {
+    const passing = candidates.filter(candidate => {
+      try { return validate(JSON.parse(candidate) as Record<string, unknown>) } catch { return false }
+    })
+    if (passing.length >= 1) return passing[passing.length - 1]
+    if (candidates.length === 1) return candidates[0]
+    throw new Error('AI 返回包含多个完整 JSON 对象，无法确定唯一结构化结果')
+  }
   if (candidates.length === 1) return candidates[0]
   if (candidates.length > 1) throw new Error('AI 返回包含多个完整 JSON 对象，无法确定唯一结构化结果')
   throw new Error('AI 返回未包含一个完整 JSON 对象')
@@ -157,7 +173,8 @@ export function extractSingleCompleteJsonObject(content: string, excludeArrayRoo
 
 // i18n-exempt: architecture.command 在调用处按界面语言包装：英文界面只给英文概要，中文界面附这条细节
 export function decodeCharacterIdentityManifest(content: string): CharacterIdentitySlot[] {
-  const parsed = JSON.parse(extractSingleCompleteJsonObject(content)) as { slots?: unknown }
+  const parsed = JSON.parse(extractSingleCompleteJsonObject(content, false, value =>
+    Object.keys(value).every(key => key === 'slots') && Array.isArray(value.slots))) as { slots?: unknown }
   if (!Array.isArray(parsed.slots)) throw new Error('角色身份清单缺少 slots')
   if (Object.keys(parsed).some(key => key !== 'slots')) throw new Error('角色身份清单包含未知字段')
   if (parsed.slots.length < MIN_CHARACTER_SLOTS || parsed.slots.length > MAX_CHARACTER_SLOTS) {
@@ -360,7 +377,8 @@ export function parseMaterialExtraction(content: string): MaterialExtraction[] {
 
 // i18n-exempt: 调用方 catch 后改走重建或给出按语言的说明，不显示这条原文
 export function decodeCharacterDetails(content: string, version: ArchitectureDerivationVersion = 2): CharacterDetailOutput[] {
-  const parsed = JSON.parse(extractSingleCompleteJsonObject(content)) as { entries?: unknown }
+  const parsed = JSON.parse(extractSingleCompleteJsonObject(content, false, value =>
+    Object.keys(value).every(key => key === 'entries') && Array.isArray(value.entries))) as { entries?: unknown }
   if (!Array.isArray(parsed.entries)) throw new Error('角色详情响应缺少 entries')
   return parsed.entries.map((candidate) => {
     if (!isRecord(candidate)) return candidate as unknown as CharacterDetailOutput

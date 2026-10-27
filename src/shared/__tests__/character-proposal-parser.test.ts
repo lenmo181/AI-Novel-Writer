@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { CHARACTER_DETAIL_DESCRIPTION_FIELDS, CHARACTER_STATE_TEXT_FIELDS, characterProposalMaterialChunks, decodeCharacterDetails, extractSingleCompleteJsonObject, parseArchitectureCharacterProposal, parsePlanningMaterialCharacterProposal, validateCharacterDetail } from '../character-proposal-parser'
+import { CHARACTER_DETAIL_DESCRIPTION_FIELDS, CHARACTER_STATE_TEXT_FIELDS, characterProposalMaterialChunks, decodeCharacterDetails, extractSingleCompleteJsonObject, parseArchitectureCharacterProposal, parsePlanningMaterialCharacterProposal, validateCharacterDetail, decodeCharacterIdentityManifest } from '../character-proposal-parser'
 
 function architecture() {
   const slots = ['同名', '同名', '反派'].map((name, index) => ({ slotId: `slot-${index}`, name,
@@ -85,5 +85,44 @@ describe('main-safe source-local character proposal parsing', () => {
     expect(chunks.map(item => item.sourceId)).toEqual(['1:1', '1:2'])
     expect(chunks.map(item => item.text).join('')).toBe(text)
     expect(chunks[1].text.startsWith('😀')).toBe(true)
+  })
+})
+
+describe('extractSingleCompleteJsonObject 多候选选择', () => {
+  const manifest = JSON.stringify({ slots: [
+    { slotId: '1', name: '林砚', role: 'protagonist', narrativeDuty: '主线', relations: [{ targetSlotId: '2', relation: '父子' }] },
+    { slotId: '2', name: '林父', role: 'supporting', narrativeDuty: '悬念', relations: [{ targetSlotId: '1', relation: '父子' }] },
+    { slotId: '3', name: '初一', role: 'minor', narrativeDuty: '同行', relations: [{ targetSlotId: '1', relation: '同盟' }] },
+  ] })
+
+  it('草稿+修订+示例对象并存时，取最后一个通过信封校验的候选', () => {
+    const content = [
+      '让我先整理一下。',
+      JSON.stringify({ slots: [] }),
+      manifest,
+      '以上就是完整的角色清单。',
+    ].join('\n')
+    const parsed = JSON.parse(extractSingleCompleteJsonObject(content, false,
+      value => Object.keys(value).every(key => key === 'slots') && Array.isArray(value.slots)))
+    expect(parsed.slots).toHaveLength(3)
+  })
+
+  it('全部候选都不符合契约且只有一个候选时，原样返回交给下游给出精确错误', () => {
+    const content = '前言\n' + JSON.stringify({ entries: [] })
+    const parsed = JSON.parse(extractSingleCompleteJsonObject(content, false,
+      value => Object.keys(value).every(key => key === 'slots') && Array.isArray(value.slots)))
+    expect(parsed).toEqual({ entries: [] })
+  })
+
+  it('多个候选都不符合契约时保留原本的歧义报错', () => {
+    const content = JSON.stringify({ a: 1 }) + '\n' + JSON.stringify({ b: 2 })
+    expect(() => extractSingleCompleteJsonObject(content, false,
+      value => Object.keys(value).every(key => key === 'slots'))).toThrow('AI 返回包含多个完整 JSON 对象，无法确定唯一结构化结果')
+  })
+
+  it('decodeCharacterIdentityManifest 在草稿+修订并存时能解析', () => {
+    const content = '先想想。\n' + JSON.stringify({ slots: [] }) + '\n' + manifest
+    const slots = decodeCharacterIdentityManifest(content)
+    expect(slots.map(slot => slot.name)).toEqual(['林砚', '林父', '初一'])
   })
 })

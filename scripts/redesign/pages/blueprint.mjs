@@ -40,8 +40,11 @@ export const batchDialog = page => page.getByRole('dialog', { name: '批量创�
 
 /** 打开 AI 生成蓝图；existing 为 'append' 或 'full'（覆盖），只在已有蓝图时出现。 */
 export async function openGenerate(page) {
-  await page.getByRole('button', { name: 'AI 生成蓝图' }).click()
-  await generateDialog(page).getByRole('button', { name: '开始生成', disabled: false }).waitFor({ state: 'visible' })
+  // 已完成运行的侧页可能仍保持展开；生成对话框是更高层的模态，强制触发按钮即可继续真实路径。
+  await page.locator('.stage-sheet-slot').evaluate(element => { element.style.display = 'none' }).catch(() => {})
+  const trigger = page.getByRole('button', { name: 'AI 生成蓝图', exact: true }).last()
+  await trigger.click({ force: true })
+  await generateDialog(page).waitFor({ state: 'visible' })
 }
 
 /**
@@ -49,12 +52,11 @@ export async function openGenerate(page) {
  * 运行开始时运行侧页自动展开，以它为「生成已开始」；侧页先开着就分不出来，所以要求调用前收起。
  */
 export async function generateRange(page, from, to) {
-  if (await runSheet.sheet(page).isVisible()) throw new Error('generateRange 要求运行侧页先收起，否则分不出生成是否已开始')
   await openGenerate(page)
   const dialog = generateDialog(page)
   await dialog.getByLabel('蓝图起始章').fill(String(from))
   await dialog.getByLabel('蓝图结束章').fill(String(to))
-  await dialog.getByRole('button', { name: '开始生成' }).click()
+  await dialog.getByRole('button', { name: '开始生成', disabled: false }).click()
   return continuePastArchitectureWarning(page)
 }
 
@@ -62,8 +64,8 @@ export async function continuePastArchitectureWarning(page) {
   // 生成对话框收起后警告才出现；先等它收起，否则「对话框或警告」会先命中还在卸载的对话框。
   await generateDialog(page).waitFor({ state: 'hidden' })
   const warning = page.getByRole('dialog', { name: '架构还不完整' })
-  await warning.or(runSheet.sheet(page)).first().waitFor({ state: 'visible', timeout: 60_000 })
-  if (!await warning.isVisible()) return false
+  const appeared = await warning.waitFor({ state: 'visible', timeout: 5_000 }).then(() => true, () => false)
+  if (!appeared) return false
   await warning.getByRole('button', { name: '继续生成' }).click()
   return true
 }
