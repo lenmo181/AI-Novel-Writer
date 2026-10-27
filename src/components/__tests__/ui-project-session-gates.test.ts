@@ -58,7 +58,8 @@ describe('UI project session gates', () => {
 
     expect(exportDialog).toContain('const projectSession = captureProjectSession(currentProject)')
     expect(exportDialog).toContain("await ipc.invoke('dialog:select-export-directory')")
-    expect(exportDialog).toContain('exportNovel({ format, grantId: destination.grantId, includeOutline }, projectSnapshot, projectSession)')
+    expect(exportDialog).toContain('grantId: destination.grantId, includeOutline, ...(parsedRange ? { chapterRange: parsedRange } : {}) }')
+    expect(exportDialog).toMatch(/exportNovel\(\s*\{[\s\S]*?\},\s*projectSnapshot,\s*projectSession,/u)
     expect(clearDialog).toContain('const projectSession = captureProjectSession(currentProject)')
     expect(clearDialog).toContain('clearProjectData(selected, projectSession)')
   })

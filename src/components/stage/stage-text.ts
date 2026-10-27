@@ -33,6 +33,8 @@ export const RESOURCE_NAMES: Record<ResourcePage, [string, string]> = {
   plot: ['剧情与伏笔', 'Plot & threads'],
   knowledge: ['知识库', 'Knowledge base'],
   history: ['版本历史', 'Version history'],
+  search: ['全书检索', 'Book search'],
+  stats: ['写作统计', 'Writing stats'],
   'review-center': ['全文审稿', 'Full review'],
 }
 
@@ -45,6 +47,8 @@ const PAGE_TAB_NAMES: Partial<Record<EditorTab['type'], [string, string]>> = {
   'narrative-thread': RESOURCE_NAMES.plot,
   knowledge: RESOURCE_NAMES.knowledge,
   'version-history': RESOURCE_NAMES.history,
+  'book-search': RESOURCE_NAMES.search,
+  'writing-stats': RESOURCE_NAMES.stats,
   'review-center': RESOURCE_NAMES['review-center'],
 }
 

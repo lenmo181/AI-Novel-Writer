@@ -20,6 +20,8 @@ import { SettingsPage, SetupPage } from './stage-pages'
 import StageHistory from './history/StageHistory'
 import StageKnowledge from './knowledge/StageKnowledge'
 import StagePlot from './plot/StagePlot'
+import StageBookSearch from './search/StageBookSearch'
+import StageWritingStats from './stats/StageWritingStats'
 import ReviewCenter from './review/ReviewCenter'
 import StageTabMenu, { CloseTabsConfirm } from './StageTabMenu'
 import StageTabs from './StageTabs'
@@ -49,6 +51,8 @@ function TabContent({ tab, project }: { tab: EditorTab; project: ProjectData }) 
   }
   if (tab.type === 'version-history' && sameProject) return <StageHistory projectKey={project.path} />
   if (tab.type === 'knowledge' && sameProject) return <StageKnowledge tabId={tab.id} />
+  if (tab.type === 'book-search' && sameProject) return <StageBookSearch />
+  if (tab.type === 'writing-stats' && sameProject) return <StageWritingStats />
   if (tab.type === 'narrative-thread' && sameProject) {
     return <StagePlot projectKey={project.path} initialView={tab.narrativeThreadView ?? 'plans'} viewRequest={tab.narrativeThreadViewRequest} />
   }

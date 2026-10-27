@@ -12,6 +12,8 @@ const PAGE_TABS: Partial<Record<WorkStage | ResourcePage, (text: Text) => void>>
   blueprint: text => openBuiltinEditor('chapter-card-editor', text('章节蓝图', 'Chapter blueprint'), 'chapter-card'),
   plot: text => openBuiltinEditor('narrative-thread-editor', text('剧情树与叙事线索', 'Plot tree & narrative threads'), 'narrative-thread', 'plot-tree'),
   history: text => openBuiltinEditor('version-history', text('版本历史', 'Version history'), 'version-history'),
+  search: text => openBuiltinEditor('book-search', text('全书检索', 'Book search'), 'book-search'),
+  stats: text => openBuiltinEditor('writing-stats', text('写作统计', 'Writing stats'), 'writing-stats'),
   setup: text => {
     const projectKey = useProjectStore.getState().currentProject?.path
     if (projectKey) useEditorStore.getState().openFile({ id: 'config', name: text('小说配置', 'Novel configuration'), type: 'config', projectKey })

@@ -71,6 +71,7 @@ export function useResumePlotOutline(run: WorkflowRun) {
         run.projectSession.projectId,
       )
       if (!expectedRecoveryHandle) {
+        // i18n-exempt: 这条错误按运行冻结的界面语言写成，捕获侧经 displayedErrorMessage 原样展示。
         throw new Error(run.uiLocale === 'en-US'
           ? 'The interrupted outline run is no longer available. Open Architecture and review the saved checkpoint before continuing.'
           : '找不到这次中断的大纲运行记录。请先打开架构页检查已保存的断点，再继续生成。')

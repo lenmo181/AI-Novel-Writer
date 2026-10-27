@@ -6,6 +6,8 @@ import { assertGenerationSourcesCurrent, assertGenerationSynopsisCommit, commitG
 import { projectAccess } from '../services/project-access'
 import { reviewCenterOverview } from '../services/review-overview'
 import { chapterFactsOverview } from '../services/chapter-facts-overview'
+import { searchBook } from '../services/book-search-service'
+import { writingStatsOverview } from '../services/writing-stats-service'
 import { getProjectDataRoot } from '../services/project-data-locator'
 import { readPortableCurrentAuthority } from '../services/portable-current-authority'
 import { currentDerivedCharacterFields } from '../services/current-character-projection'
@@ -1298,6 +1300,16 @@ export function registerDatabaseController(options: DatabaseControllerOptions = 
   ipcMain.handle('db:get-llm-history', async (_event, limit: number | undefined, expectedProjectPath: string) => {
     assertRequiredExpectedProjectPath(getCurrentProjectPath(), expectedProjectPath)
     return LLMHistoryRepository.getHistory(limit ?? 50)
+  })
+
+  ipcMain.handle('db:book-search', async (_event, query: string, expectedProjectPath: string) => {
+    assertRequiredExpectedProjectPath(getCurrentProjectPath(), expectedProjectPath)
+    return searchBook(typeof query === 'string' ? query : '')
+  })
+
+  ipcMain.handle('db:writing-stats', async (_event, expectedProjectPath: string) => {
+    assertRequiredExpectedProjectPath(getCurrentProjectPath(), expectedProjectPath)
+    return writingStatsOverview()
   })
 
   ipcMain.handle('db:save-summary-snapshot', async (_event, chapterNumber: number, characterStates: string, expectedProjectPath: string) => {

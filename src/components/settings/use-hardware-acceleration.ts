@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 
+import { displayedErrorMessage } from '../../i18n/app-errors'
 import { ipc } from '../../services/ipc-client'
 import { useLocaleStore } from '../../stores/locale-store'
 
@@ -34,7 +35,7 @@ export function useHardwareAcceleration() {
       setPendingRestart(true)
     } catch (cause) {
       setEnabled(previous)
-      setError(cause instanceof Error ? cause.message : String(cause))
+      setError(displayedErrorMessage(useLocaleStore.getState().locale, cause))
     } finally {
       setSaving(false)
     }

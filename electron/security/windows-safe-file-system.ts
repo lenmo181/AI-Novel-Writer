@@ -46,6 +46,13 @@ export interface SecureFileSystem {
     beforeReplace?: () => void | Promise<void>,
     constraints?: AtomicWriteConstraints,
   ): Promise<void>
+  /** 任意字节的原写原子替换（EPUB 等二进制导出）；内容编码由调用方决定，helper 只认字节。 */
+  writeBinaryAtomically(
+    capability: SecureFileCapability,
+    content: Uint8Array,
+    beforeReplace?: () => void | Promise<void>,
+    constraints?: AtomicWriteConstraints,
+  ): Promise<void>
   mkdir(capability: SecureFileCapability): Promise<void>
   exists(capability: SecureFileCapability): Promise<boolean>
   listDirectory(capability: SecureFileCapability): Promise<SecureDirectoryEntry[]>
@@ -594,6 +601,39 @@ export function createSecureFileSystem(
     return buffer
   }
 
+  // 文本与二进制写入共用同一条 helper 通路：内容都以 base64 交给平台助手原子替换。
+  const writeBytesAtomically = async (
+    capability: SecureFileCapability,
+    buffer: Buffer,
+    beforeReplace?: () => void | Promise<void>,
+    constraints?: AtomicWriteConstraints,
+  ): Promise<void> => {
+    const safeCapability = validateCapability(capability)
+    const request: HelperRequest = {
+      operation: 'write',
+      rootPath: safeCapability.rootPath,
+      relativePath: safeCapability.relativePath,
+      rootIdentity: safeCapability.rootIdentity,
+      contentBase64: buffer.toString('base64'),
+      mustAlreadyExist: constraints?.mustAlreadyExist === true,
+    }
+    if (usingTestInvoke) {
+      const response = await invoke(request)
+      if (!response.ok) responseError(response)
+      await beforeReplace?.()
+      return
+    }
+    const supportedPlatform = securePlatform()
+    const response = await invokeBundledAtomicWrite(
+      request,
+      supportedPlatform,
+      resolveHelperPath(),
+      timeoutMs,
+      beforeReplace,
+    )
+    if (!response.ok) responseError(response)
+  }
+
   return {
     readBytes,
 
@@ -610,30 +650,13 @@ export function createSecureFileSystem(
       if (typeof content !== 'string') throw secureError('SECURE_FS_INVALID_TEXT')
       const buffer = Buffer.from(content, 'utf8')
       if (buffer.length > MAX_TEXT_BYTES) throw secureError('SECURE_FS_FILE_TOO_LARGE')
-      const safeCapability = validateCapability(capability)
-      const request: HelperRequest = {
-        operation: 'write',
-        rootPath: safeCapability.rootPath,
-        relativePath: safeCapability.relativePath,
-        rootIdentity: safeCapability.rootIdentity,
-        contentBase64: buffer.toString('base64'),
-        mustAlreadyExist: constraints?.mustAlreadyExist === true,
-      }
-      if (usingTestInvoke) {
-        const response = await invoke(request)
-        if (!response.ok) responseError(response)
-        await beforeReplace?.()
-        return
-      }
-      const supportedPlatform = securePlatform()
-      const response = await invokeBundledAtomicWrite(
-        request,
-        supportedPlatform,
-        resolveHelperPath(),
-        timeoutMs,
-        beforeReplace,
-      )
-      if (!response.ok) responseError(response)
+      await writeBytesAtomically(capability, buffer, beforeReplace, constraints)
+    },
+
+    async writeBinaryAtomically(capability, content, beforeReplace, constraints) {
+      if (!(content instanceof Uint8Array)) throw secureError('SECURE_FS_INVALID_TEXT')
+      if (content.length > MAX_TEXT_BYTES) throw secureError('SECURE_FS_FILE_TOO_LARGE')
+      await writeBytesAtomically(capability, Buffer.from(content.buffer, content.byteOffset, content.byteLength), beforeReplace, constraints)
     },
 
     async mkdir(capability) {

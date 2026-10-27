@@ -5,6 +5,7 @@
  * - 合并 Markdown（全书合并为单个 .md）
  * - 分章 Markdown（每章一个 .md）
  * - 纯文本 TXT
+ * - EPUB 3 电子书
  */
 import { ipc } from './ipc-client'
 import { requireIpcSuccess } from './ipc-result'
@@ -25,9 +26,16 @@ import {
 import type { WritingLanguage } from '../shared/writing-language'
 import { randomUUID } from '../utils/id'
 import { pluralEn } from '../shared/plural-en'
+import { buildEpub, epubBytesToBase64, type EpubChapterInput } from '../shared/epub-builder'
 
 
-export type ExportFormat = 'merged-md' | 'split-md' | 'txt'
+export type ExportFormat = 'merged-md' | 'split-md' | 'txt' | 'epub'
+
+/** 只导出第 from 到 to 章（含两端）；缺省为全书。 */
+export interface ExportChapterRange {
+  from: number
+  to: number
+}
 
 interface ExportOptions {
   format: ExportFormat
@@ -35,6 +43,7 @@ interface ExportOptions {
   grantId: string
   includeOutline?: boolean
   includeCharacters?: boolean
+  chapterRange?: ExportChapterRange
 }
 
 /** 导出任务冻结的项目展示数据；项目路径本身绝不作为访问凭据。 */
@@ -282,11 +291,31 @@ export async function exportNovel(
       }
     }
 
+    // 章节范围只影响写入哪些章；定稿权威校验仍覆盖全书，范围外的章一变也会中止。
+    const range = normalizeChapterRange(options.chapterRange)
+    const scopedContents = range
+      ? chapterContents.filter(chapter => chapter.chapterNumber >= range.from && chapter.chapterNumber <= range.to)
+      : chapterContents
+    if (scopedContents.length === 0) {
+      return {
+        success: false,
+        error: text(
+          `第 ${range?.from}–${range?.to} 章范围内没有定稿章节`,
+          `No finalized chapters fall inside chapters ${range?.from}–${range?.to}.`,
+        ),
+      }
+    }
+
     if (!isProjectSessionCurrent(projectSession)) return staleExportResult(uiLocale)
-    addLog('info', text(
-      `找到 ${chapterContents.length} 个已定稿章节`,
-      `Found ${chapterContents.length} finalized ${pluralEn(chapterContents.length, 'chapter')}.`,
-    ), uiLocale)
+    addLog('info', range
+      ? text(
+        `找到 ${scopedContents.length} 个已定稿章节（第 ${range.from}–${range.to} 章范围）`,
+        `Found ${scopedContents.length} finalized ${pluralEn(scopedContents.length, 'chapter')} (chapters ${range.from}–${range.to}).`,
+      )
+      : text(
+        `找到 ${scopedContents.length} 个已定稿章节`,
+        `Found ${scopedContents.length} finalized ${pluralEn(scopedContents.length, 'chapter')}.`,
+      ), uiLocale)
 
     let outputPath = ''
     const projectFileStem = exportFileStem(project.name)
@@ -311,7 +340,7 @@ export async function exportNovel(
         }
 
         // 章节内容
-        for (const ch of chapterContents) {
+        for (const ch of scopedContents) {
           content += ch.markdownContent + '\n\n---\n\n'
         }
 
@@ -357,7 +386,7 @@ export async function exportNovel(
           text('创建导出目录失败', 'Failed to create the export directory.'),
         )
 
-        for (const ch of chapterContents) {
+        for (const ch of scopedContents) {
           const stillCurrent = await ipc.invokeWithProjectSession(
             projectSession,
             'db:draft-export-authority-current',
@@ -390,7 +419,7 @@ export async function exportNovel(
         // 纯文本（去除 Markdown 格式）
         let content = `${project.name}\n${'='.repeat(project.name.length * 2)}\n\n`
 
-        for (const ch of chapterContents) {
+        for (const ch of scopedContents) {
           // 简单去除 Markdown 标记
           const plainText = ch.markdownContent
             .replace(/^#{1,6}\s+/gm, '')  // 去掉标题标记
@@ -414,6 +443,47 @@ export async function exportNovel(
         if (!authorityCurrent) return changedFinalizationResult(uiLocale)
         activeWritePath = outputPath
         const writeResult = await ipc.invoke('fs:grant-write-file', options.grantId, outputPath, content)
+        requireExportWriteSuccess(
+          writeResult,
+          text('写入导出文件', 'Write export file'),
+          text('写入导出文件失败', 'Failed to write the exported file.'),
+        )
+        activeWritePath = undefined
+        if (!isProjectSessionCurrent(projectSession)) {
+          return staleCommittedSingleExportResult(uiLocale, outputPath)
+        }
+        break
+      }
+
+      case 'epub': {
+        // EPUB 3 电子书：定稿正文打包成单文件 .epub
+        const epubChapters: EpubChapterInput[] = scopedContents.map(ch => ({
+          chapterNumber: ch.chapterNumber,
+          title: ch.title,
+          content: ch.content,
+        }))
+        const epubBytes = buildEpub({
+          title: project.name,
+          language: project.novelConfig.writingLanguage,
+          chapters: epubChapters,
+          modifiedIso: new Date().toISOString(),
+        })
+        outputPath = `${projectFileStem}.epub`
+        const authorityCurrent = await ipc.invokeWithProjectSession(
+          projectSession,
+          'db:draft-export-authority-current',
+          authorityReceipt,
+          projectSession.projectPath,
+        )
+        if (!isProjectSessionCurrent(projectSession)) return staleExportResult(uiLocale)
+        if (!authorityCurrent) return changedFinalizationResult(uiLocale)
+        activeWritePath = outputPath
+        const writeResult = await ipc.invoke(
+          'fs:grant-write-file-base64',
+          options.grantId,
+          outputPath,
+          epubBytesToBase64(epubBytes),
+        )
         requireExportWriteSuccess(
           writeResult,
           text('写入导出文件', 'Write export file'),
@@ -481,6 +551,16 @@ function formatLabel(format: ExportFormat, locale: Locale): string {
     'merged-md': ['合并 Markdown', 'Merged Markdown'],
     'split-md': ['分章 Markdown', 'Split Markdown'],
     'txt': ['纯文本 TXT', 'Plain text (TXT)'],
+    'epub': ['EPUB 电子书', 'EPUB e-book'],
   }
   return labels[format][locale === 'en-US' ? 1 : 0]
+}
+
+/** 范围归一化：非法（NaN、from > to 或越出正整数）时丢弃，退回全书。 */
+function normalizeChapterRange(range: ExportChapterRange | undefined): ExportChapterRange | undefined {
+  if (!range) return undefined
+  const from = Math.floor(range.from)
+  const to = Math.floor(range.to)
+  if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) || from < 1 || from > to) return undefined
+  return { from, to }
 }

@@ -14,6 +14,8 @@ import {
 
 const EXPORT_GRANT_TTL_MS = 10 * 60 * 1_000
 const EXPORT_GRANT_MAX_USES = 4_096
+/** 单次二进制导出的解码上限，与安全文件系统的文本写入上限一致。 */
+const MAX_GRANT_BINARY_BYTES = 64 * 1024 * 1024
 
 function text(zhCNText: string, enUSText: string): string {
   return mainText(app.getLocale(), zhCNText, enUSText)
@@ -167,6 +169,48 @@ export function registerExternalFileGrantController(
         return { success: true }
       } catch (error) {
         return { success: false, error: grantErrorText(error) }
+      }
+    },
+  )
+
+  ipcMain.handle(
+    'fs:grant-write-file-base64',
+    async (event: GrantEvent, grantId: string, relativePath: string, contentBase64: string) => {
+      try {
+        // 只接受标准 base64（可完整往返），防止静默丢弃非法字符后写出损坏文件。
+        if (typeof contentBase64 !== 'string' || contentBase64 === '') {
+          throw new Error('EXTERNAL_FILE_GRANT_EMPTY_CONTENT')
+        }
+        const bytes = Buffer.from(contentBase64, 'base64')
+        if (bytes.length > MAX_GRANT_BINARY_BYTES || bytes.toString('base64') !== contentBase64) {
+          throw new Error('EXTERNAL_FILE_GRANT_INVALID_CONTENT')
+        }
+        const target = resolveGrantPath(grants, event, grantId, 'write', relativePath)
+        const targetExists = await fileSystem.exists(target)
+        let canCreate = false
+        let createPermissionError: unknown
+        try {
+          resolveGrantPath(grants, event, grantId, 'create', relativePath, false)
+          canCreate = true
+        } catch (error) {
+          createPermissionError = error
+        }
+        if (!targetExists && !canCreate) {
+          throw createPermissionError
+        }
+        await fileSystem.writeBinaryAtomically(target, bytes, () => {
+          resolveGrantPath(grants, event, grantId, 'write', relativePath, false)
+          if (canCreate) {
+            resolveGrantPath(grants, event, grantId, 'create', relativePath, false)
+          }
+        }, { mustAlreadyExist: !canCreate })
+        return { success: true }
+      } catch (error) {
+        return {
+          success: false,
+          commitState: atomicWriteFailureCommitState(error) ?? 'not_committed',
+          error: grantErrorText(error),
+        }
       }
     },
   )

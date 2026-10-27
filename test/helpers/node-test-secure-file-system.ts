@@ -73,6 +73,34 @@ async function readBytes(
   return content
 }
 
+async function writeBytesAtomically(
+  capability: SecureFileCapability,
+  bytes: Uint8Array,
+  beforeReplace?: () => void | Promise<void>,
+  constraints?: { mustAlreadyExist?: boolean },
+): Promise<void> {
+  const initialTarget = resolveCapability(capability)
+  if (constraints?.mustAlreadyExist && !fs.existsSync(initialTarget)) {
+    throw secureError('SECURE_FS_NOT_FOUND')
+  }
+  await beforeReplace?.()
+  const targetPath = resolveCapability(capability)
+  if (constraints?.mustAlreadyExist && !fs.existsSync(targetPath)) {
+    throw secureError('SECURE_FS_NOT_FOUND')
+  }
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true })
+  const temporaryPath = path.join(
+    path.dirname(targetPath),
+    `.${path.basename(targetPath)}.${process.pid}.${Date.now()}.tmp`,
+  )
+  try {
+    fs.writeFileSync(temporaryPath, bytes)
+    fs.renameSync(temporaryPath, targetPath)
+  } finally {
+    fs.rmSync(temporaryPath, { force: true })
+  }
+}
+
 export const nodeTestSecureFileSystem: SecureFileSystem = {
   readBytes,
 
@@ -86,26 +114,11 @@ export const nodeTestSecureFileSystem: SecureFileSystem = {
   },
 
   async writeTextAtomically(capability, content, beforeReplace, constraints) {
-    const initialTarget = resolveCapability(capability)
-    if (constraints?.mustAlreadyExist && !fs.existsSync(initialTarget)) {
-      throw secureError('SECURE_FS_NOT_FOUND')
-    }
-    await beforeReplace?.()
-    const targetPath = resolveCapability(capability)
-    if (constraints?.mustAlreadyExist && !fs.existsSync(targetPath)) {
-      throw secureError('SECURE_FS_NOT_FOUND')
-    }
-    fs.mkdirSync(path.dirname(targetPath), { recursive: true })
-    const temporaryPath = path.join(
-      path.dirname(targetPath),
-      `.${path.basename(targetPath)}.${process.pid}.${Date.now()}.tmp`,
-    )
-    try {
-      fs.writeFileSync(temporaryPath, content, 'utf8')
-      fs.renameSync(temporaryPath, targetPath)
-    } finally {
-      fs.rmSync(temporaryPath, { force: true })
-    }
+    await writeBytesAtomically(capability, Buffer.from(content, 'utf8'), beforeReplace, constraints)
+  },
+
+  async writeBinaryAtomically(capability, content, beforeReplace, constraints) {
+    await writeBytesAtomically(capability, content, beforeReplace, constraints)
   },
 
   async mkdir(capability) {

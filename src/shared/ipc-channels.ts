@@ -12,6 +12,8 @@ import type { CharacterAvatarChannels } from './character-avatar'
 import type { CloudBackupChannels } from './cloud-backup'
 import type { CmCloudChannels } from './cm-cloud'
 import type { ProjectOverview } from './project-overview'
+import type { BookSearchResult } from './book-search'
+import type { WritingStatsOverview } from './writing-stats'
 /**
  * IPC 频道定义 — 渲染进程与主进程的类型安全通信契约
  * 所有 IPC 调用都通过此文件定义频道名和参数/返回值类型
@@ -523,6 +525,13 @@ export interface FileChannels {
   }
   'fs:grant-write-file': {
     args: [grantId: string, relativePath: string, content: string]
+    return:
+      | { success: true }
+      | { success: false; commitState: Exclude<FileWriteCommitState, 'committed'>; error?: string }
+  }
+  /** 二进制导出（EPUB）用：内容是标准 base64，其余语义与 fs:grant-write-file 一致。 */
+  'fs:grant-write-file-base64': {
+    args: [grantId: string, relativePath: string, contentBase64: string]
     return:
       | { success: true }
       | { success: false; commitState: Exclude<FileWriteCommitState, 'committed'>; error?: string }
@@ -1221,6 +1230,16 @@ export interface DatabaseChannels {
     }
   }
   'db:get-llm-history': { args: [limit: number | undefined, expectedProjectPath: string]; return: unknown[] }
+  /** 全书检索：在正文最新稿、蓝图、角色与架构设定里查关键词，返回摘录而不是全文。 */
+  'db:book-search': {
+    args: [query: string, expectedProjectPath: string]
+    return: BookSearchResult
+  }
+  /** 写作统计：进度、字数与模型用量的只读聚合。 */
+  'db:writing-stats': {
+    args: [expectedProjectPath: string]
+    return: WritingStatsOverview
+  }
   'db:save-summary-snapshot': { args: [chapterNumber: number, characterStates: string, expectedProjectPath: string]; return: { success: boolean } }
   'db:get-latest-summary': { args: [expectedProjectPath: string]; return: { characterStates: string; chapterNumber: number } | null }
 }

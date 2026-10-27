@@ -767,6 +767,10 @@ const UNREGISTERED: Record<string, readonly string[]> = {
     'EXTERNAL_FILE_GRANT_TTL_INVALID',
     'EXTERNAL_FILE_GRANT_USES_INVALID',
     'EXTERNAL_FILE_GRANT_WRONG_WINDOW',
+    // 二进制导出（EPUB）的载荷校验（fs:grant-write-file-base64）：内容只来自渲染端自己的构建器，
+    // 传空或非标准 base64 属于程序缺陷；external-file-grant-controller 按码换成「外部文件授权操作失败」。
+    'EXTERNAL_FILE_GRANT_EMPTY_CONTENT',
+    'EXTERNAL_FILE_GRANT_INVALID_CONTENT',
     // 剧情页对读取、清除剧情树与线索的增删改按固定的按语言说明提示，不显示主进程原文（#474 B2）；
     // AI 生成的线索与剧情树经生成确认保存，这些码在那里统一成 GENERATION_REQUEST_FAILED。
     'NARRATIVE_THREAD_EVENT_INVALID',

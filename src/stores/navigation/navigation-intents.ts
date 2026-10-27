@@ -5,7 +5,7 @@ import { stageNavigate } from './stage-navigation'
 export type WorkStage = 'setup' | 'architecture' | 'blueprint' | 'manuscript'
 
 /** 流程脊下方的作品资料页；全文审稿中心是资料页里的跨章工作台。 */
-export type ResourcePage = 'plot' | 'knowledge' | 'history' | 'review-center'
+export type ResourcePage = 'plot' | 'knowledge' | 'history' | 'search' | 'stats' | 'review-center'
 
 /** 运行侧页的分页：实时输出、任务进度、诊断里的日志与模型调用。 */
 export type RunPaneFacet = 'output' | 'tasks' | 'log' | 'models'

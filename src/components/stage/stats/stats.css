@@ -1,0 +1,193 @@
+/* ================= 写作统计：概览卡 / 每章字数 / 每日活动 / 用量 ================= */
+.stage-stats {
+  height: 100%;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--s-5);
+}
+
+.stage-stats-title {
+  margin: 0;
+  font: 600 var(--fs-20)/1.3 var(--font-display);
+  color: var(--ink);
+}
+
+.stage-stats-help {
+  margin: var(--s-1) 0 0;
+  font-size: var(--fs-12);
+  color: var(--ink-3);
+}
+
+.stage-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: var(--s-3);
+  margin: var(--s-4) 0;
+}
+
+.stage-stats-cell {
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+  padding: var(--s-3);
+  background: var(--paper);
+}
+
+.stage-stats-cell-label {
+  margin: 0;
+  font-size: var(--fs-12);
+  color: var(--ink-3);
+}
+
+.stage-stats-cell-value {
+  margin: var(--s-1) 0 0;
+  font: 600 var(--fs-20)/1.2 var(--font-display);
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.stage-stats-cell-meta {
+  margin: var(--s-1) 0 0;
+  font-size: var(--fs-12);
+  color: var(--ink-3);
+}
+
+.stage-stats-section {
+  margin: 0 0 var(--s-5);
+}
+
+.stage-stats-section-name {
+  margin: 0 0 var(--s-2);
+  font: 600 var(--fs-13)/1.4 var(--font-display);
+  color: var(--ink-2);
+}
+
+.stage-stats-chapters {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+}
+
+.stage-stats-chapter {
+  display: grid;
+  grid-template-columns: minmax(120px, 240px) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--s-2);
+  font-size: var(--fs-13);
+}
+
+.stage-stats-chapter-name {
+  color: var(--ink-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stage-stats-chapter-bar {
+  height: 10px;
+  border-radius: 999px;
+  background: var(--wash);
+  overflow: hidden;
+}
+
+.stage-stats-chapter-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+.stage-stats-chapter[data-status='finalized'] .stage-stats-chapter-bar > span {
+  background: var(--accent-hover);
+}
+
+.stage-stats-chapter-count {
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-2);
+}
+
+.stage-stats-daily {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 96px;
+  padding: var(--s-2) 0 0;
+}
+
+.stage-stats-day {
+  flex: 1;
+  min-width: 4px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 2px;
+  height: 100%;
+}
+
+.stage-stats-day > span {
+  display: block;
+  border-radius: 3px 3px 0 0;
+  background: var(--accent-track);
+}
+
+.stage-stats-day > span[data-kind='words'] {
+  background: var(--accent);
+}
+
+.stage-stats-day-axis {
+  display: flex;
+  justify-content: space-between;
+  margin: var(--s-1) 0 0;
+  font-size: var(--fs-12);
+  color: var(--ink-4);
+}
+
+.stage-stats-usage {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.stage-stats-usage li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: var(--s-3);
+  padding: var(--s-1) 0;
+  border-bottom: 1px solid var(--rule);
+  font-size: var(--fs-13);
+}
+
+.stage-stats-usage li:last-child {
+  border-bottom: none;
+}
+
+.stage-stats-usage-label {
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stage-stats-usage-value {
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-2);
+}
+
+.stage-stats-empty {
+  margin: var(--s-6) auto 0;
+  max-width: 420px;
+  text-align: center;
+  color: var(--ink-3);
+  font-size: var(--fs-13);
+  line-height: 1.8;
+}
+
+.stage-stats-failed {
+  margin: var(--s-4) 0 0;
+  color: var(--danger);
+  font-size: var(--fs-13);
+}

@@ -188,6 +188,8 @@ const TAB_LOCATION: Record<EditorTab['type'], StageLocation> = {
   'narrative-thread': { kind: 'resource', page: 'plot' },
   knowledge: { kind: 'resource', page: 'knowledge' },
   'version-history': { kind: 'resource', page: 'history' },
+  'book-search': { kind: 'resource', page: 'search' },
+  'writing-stats': { kind: 'resource', page: 'stats' },
   'review-center': { kind: 'resource', page: 'review-center' },
 }
 

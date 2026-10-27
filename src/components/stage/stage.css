@@ -25,4 +25,6 @@
 @import './history/history.css';
 @import './knowledge/knowledge.css';
 @import './plot/plot.css';
+@import './search/search.css';
+@import './stats/stats.css';
 @import './styles/stage-review-center.css';

@@ -72,6 +72,17 @@ const testFileSystem: WindowsSafeFileSystem = {
       await fsPromises.unlink(temporary).catch(() => undefined)
     }
   },
+  async writeBinaryAtomically(capability, content, beforeReplace) {
+    const target = capabilityPath(capability)
+    const temporary = `${target}.test-tmp`
+    try {
+      await fsPromises.writeFile(temporary, content)
+      await beforeReplace?.()
+      fs.renameSync(temporary, target)
+    } finally {
+      await fsPromises.unlink(temporary).catch(() => undefined)
+    }
+  },
   async mkdir(capability) {
     fs.mkdirSync(capabilityPath(capability), { recursive: true })
   },
